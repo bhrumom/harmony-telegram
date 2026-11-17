@@ -1,0 +1,6 @@
+{
+  "name": "libtelegram_core.so",
+  "types": "./index.d.ts",
+  "version": "1.2.0",
+  "description": "HarmonyOS Native Fabushi / GPUI Telegram Rust N-API Core Module"
+}

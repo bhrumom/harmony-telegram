@@ -1,0 +1,68 @@
+[package]
+name = "telegram_ohos_napi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "telegram_core"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "telegram_ohos_cli"
+path = "src/bin/telegram_ohos_cli.rs"
+
+[dependencies]
+gpui_telegram_core.workspace = true
+gpui_telegram_proto.workspace = true
+gpui_telegram_media.workspace = true
+gpui_telegram_agent.workspace = true
+gpui_telegram_client.workspace = true
+fabushi_miniapp.workspace = true
+magpie_gateway.workspace = true
+mahayana-computer.workspace = true
+mahayana-host-protocol.workspace = true
+fabushi-messaging-core.workspace = true
+
+tokio.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+tungstenite.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+rusqlite.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+chacha20poly1305.workspace = true
+sha2.workspace = true
+sha1.workspace = true
+hmac.workspace = true
+hkdf.workspace = true
+argon2.workspace = true
+getrandom.workspace = true
+image.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+
+[target.'cfg(not(target_env = "ohos"))'.dependencies]
+gpui_telegram_webrtc.workspace = true
+
+[target.'cfg(target_env = "ohos")'.dependencies]
+napi-ohos = { version = "1.2", features = ["napi8", "async", "serde-json", "tokio_rt"] }
+napi-derive-ohos = "1.2"
+
+[dev-dependencies]
+gpui_telegram_server.workspace = true
+
+[build-dependencies]
+napi-build-ohos = "1.2"

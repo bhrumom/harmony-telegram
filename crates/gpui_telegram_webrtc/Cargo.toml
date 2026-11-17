@@ -1,0 +1,26 @@
+[package]
+name = "gpui_telegram_webrtc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui_telegram_core = { workspace = true }
+gpui_telegram_proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+webrtc = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+hound = { workspace = true }
+rubato = { workspace = true }
+image = { workspace = true }
+fabushi-messaging-core = { path = "../../inherited/mahayana-messaging" }
+mahayana-node-agent-coordinator = { path = "../../inherited/node-agent-coordinator" }

@@ -1,0 +1,33 @@
+# Rust / Cargo build outputs
+/target/
+**/target/
+
+# HarmonyOS / Hvigor / DevEco Studio build outputs & local caches
+/.hvigor/
+**/.hvigor/
+/oh_modules/
+**/oh_modules/
+/build/
+/entry/build/
+/.preview/
+/entry/.preview/
+local.properties
+
+# Node / JS
+node_modules/
+**/node_modules/
+
+# Signing keys & local secrets
+*.p12
+*.jks
+*.keystore
+*.p7b
+*.cer
+*.csr
+.env
+.env.local
+
+# OS / Editor files
+.DS_Store
+*.swp
+*~

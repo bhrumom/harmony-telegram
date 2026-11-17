@@ -1,0 +1,18 @@
+{
+  "name": "harmony-telegram-e2e-ohos-suite",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Opaque-box E2E test suite for HarmonyOS Native Fabushi / GPUI Telegram",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "test": "node ./runner.mjs --tier all",
+    "self-check": "node ./runner.mjs --self-check",
+    "tier1": "node ./runner.mjs --tier 1",
+    "tier2": "node ./runner.mjs --tier 2",
+    "tier3": "node ./runner.mjs --tier 3",
+    "tier4": "node ./runner.mjs --tier 4"
+  }
+}
