@@ -9,14 +9,26 @@ export interface CoreResponseEnvelope {
   generation: number
 }
 
+export interface CorePushEvent {
+  generation: number
+  accountId: string
+  kind: string
+  payloadJson: string
+}
+
 export interface SandboxInitConfig {
-  filesDir: string
-  cacheDir: string
-  tempDir: string
-  databaseDir: string
-  resourceDir: string
-  caCertPath: string
-  defaultServerUrl: string
+  filesDir?: string
+  cacheDir?: string
+  tempDir?: string
+  databaseDir?: string
+  resourceDir?: string
+  caCertPath?: string
+  defaultServerUrl?: string
+  serverUrl?: string
+  appVersion?: string
+  deviceModel?: string
+  osFullName?: string
+  locale?: string
 }
 
 export declare function decodeWaveform5Bit(packed63Bytes: Uint8Array): Array<number>
@@ -29,11 +41,15 @@ export declare function initCore(config: SandboxInitConfig): Promise<CoreRespons
 
 export declare function invokeAction(domain: string, action: string, payloadJson: string): Promise<CoreResponseEnvelope>
 
+export declare function invokeActionSync(domain: string, action: string, payloadJson: string): CoreResponseEnvelope
+
 export declare function processTalkVadFrame(pcmI16Bytes: Uint8Array, sampleRate: number): CoreResponseEnvelope
 
 export declare function shutdownCore(): Promise<boolean>
 
 export declare function subscribeDomainEvents(callback: (eventJson: string) => void): boolean
+
+export declare function subscribePushEvents(callback: (event: CorePushEvent) => void): boolean
 
 export declare function uploadMediaChunk(uploadId: string, partIndex: number, chunkBytes: Uint8Array): Promise<CoreResponseEnvelope>
 
@@ -42,7 +58,9 @@ export interface TelegramCoreModule {
   initCore: typeof initCore;
   shutdownCore: typeof shutdownCore;
   invokeAction: typeof invokeAction;
+  invokeActionSync: typeof invokeActionSync;
   subscribeDomainEvents: typeof subscribeDomainEvents;
+  subscribePushEvents: typeof subscribePushEvents;
   encodeWaveform5Bit: typeof encodeWaveform5Bit;
   decodeWaveform5Bit: typeof decodeWaveform5Bit;
   feedVoiceRecorderPcm: typeof feedVoiceRecorderPcm;

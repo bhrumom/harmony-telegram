@@ -476,7 +476,7 @@ impl TelegramClient {
         self.gap_chats.lock().iter().copied().collect()
     }
 
-    pub(crate) fn clear_gap_chat(&self, chat_id: ChatId) {
+    pub fn clear_gap_chat(&self, chat_id: ChatId) {
         self.gap_chats.lock().remove(&chat_id);
     }
 

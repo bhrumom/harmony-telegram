@@ -96,29 +96,39 @@ pub async fn handle_bots(
             }
 
             let username = req_str(payload, &["username"], "username")?;
-            let title = opt_str(payload, &["displayName", "title", "name"])
+            let title = opt_str(payload, &["displayName", "display_name", "title", "name"])
                 .unwrap_or_else(|| username.clone());
-            let mut map = serde_json::Map::new();
-            map.insert("username".into(), Value::String(username));
-            map.insert("title".into(), Value::String(title.clone()));
-            map.insert("display_name".into(), Value::String(title.clone()));
-            map.insert("first_name".into(), Value::String(title));
-            if let Some(about) = opt_str(payload, &["about", "description"]) {
-                map.insert("about".into(), Value::String(about.clone()));
-                map.insert("description".into(), Value::String(about));
+            let about = opt_str(payload, &["about", "description"]).unwrap_or_default();
+            let req = CreateBotRequest {
+                display_name: title,
+                username,
+                description: about.clone(),
+                about,
+                ai_persona: opt_str(payload, &["aiPersona", "ai_persona"]).unwrap_or_default(),
+                menu_button_text: opt_str(payload, &["menuButtonText", "menu_button_text"]),
+                menu_button_url: opt_str(payload, &["menuButtonUrl", "menu_button_url"]),
+                allow_attach_menu: opt_bool(payload, &["allowAttachMenu", "allow_attach_menu"]).unwrap_or(false),
+                ..CreateBotRequest::default()
+            };
+            let created = client.create_bot(&req).await?;
+            let mut val = to_json_val(&created)?;
+            if let Some(bt) = val.get("bot_token").cloned() {
+                val["token"] = bt.clone();
+                val["botToken"] = bt;
             }
-            let req: CreateBotRequest = serde_json::from_value(Value::Object(map))?;
-            to_json_val(client.create_bot(&req).await?)
+            Ok(val)
         }
         "createBotFromPrompt" => {
             let prompt = req_str(payload, &["prompt", "description"], "prompt")?;
             let shape = opt_str(payload, &["avatarShape", "avatar_shape"]);
             let color = opt_str(payload, &["avatarColor", "avatar_color"]);
-            to_json_val(
-                client
-                    .create_from_natural_language_with_avatar(&prompt, shape, color)
-                    .await?,
-            )
+            let created = client
+                .create_from_natural_language_with_avatar(&prompt, shape, color)
+                .await?;
+            let mut val = to_json_val(&created)?;
+            val["token"] = Value::String(created.bot_token.clone());
+            val["botToken"] = Value::String(created.bot_token);
+            Ok(val)
         }
         "listBots" => {
             let my_bots = client.list_my_bots().await?;
@@ -194,24 +204,24 @@ pub async fn handle_bots(
             let token = client
                 .token()
                 .ok_or_else(|| CoreDispatchError::unauthorized("No active session token"))?;
-            if let Ok(res) = client
+            let bot_id = if let Some(id) = opt_u64(payload, &["botId", "bot_id", "botUserId", "bot_user_id"]) {
+                id as i64
+            } else {
+                let uname = req_str(payload, &["botUsername", "username"], "botId")?;
+                let prof = client.get_bot_public_profile(uname.trim_start_matches('@')).await?;
+                prof.bot.bot_user_id
+            };
+            let path = format!("/api/v1/bots/{bot_id}/regenerate-token");
+            let res: Value = client
                 .http_client
-                .request_json::<Value, Value>(
+                .request_json(
                     reqwest::Method::POST,
-                    "/api/v1/actions/bots.regenerate_token",
+                    &path,
                     Some(&token),
-                    Some(payload),
+                    Some(&json!({})),
                 )
-                .await
-            {
-                return Ok(res);
-            }
-            let bot_id = opt_u64(payload, &["botId", "bot_id"]).unwrap_or(600001);
-            let rotated = format!(
-                "{bot_id}:rot_{}",
-                &sha256_hex(format!("{bot_id}:{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).as_bytes())[..32]
-            );
-            Ok(json!({ "botId": bot_id, "botToken": rotated, "regenerated": true }))
+                .await?;
+            Ok(res)
         }
         "addBotToChat" => {
             let chat_id = req_i64(payload, &["chatId", "chat_id"], "chatId")?;
@@ -239,18 +249,49 @@ pub async fn handle_bots(
             let bot_username = req_str(payload, &["botUsername", "bot_username", "username"], "botUsername")?;
             let query = opt_str(payload, &["query", "q"]).unwrap_or_default();
             let clean = bot_username.trim_start_matches('@');
-            let apps = client.list_mini_apps(Some(&query), None).await.unwrap_or_default();
-            Ok(json!({
-                "botUsername": clean,
-                "query": query,
-                "results": [
-                    {
-                        "id": format!("inl_{clean}_1"),
+            let bot_prof = client.get_bot_public_profile(clean).await?;
+            let apps = client.list_mini_apps(Some(&query), None).await?;
+            let q_lower = query.to_lowercase();
+            let mut results: Vec<Value> = Vec::new();
+            for cmd in &bot_prof.bot.commands {
+                if q_lower.is_empty()
+                    || cmd.command.to_lowercase().contains(&q_lower)
+                    || cmd.description.to_lowercase().contains(&q_lower)
+                {
+                    results.push(json!({
+                        "id": format!("cmd_{}_{}", bot_prof.bot.bot_user_id, cmd.command),
                         "type": "article",
-                        "title": format!("@{clean}: {}", if query.is_empty() { "Quick Action" } else { &query }),
-                        "messageText": if query.is_empty() { format!("Inline card from @{clean}") } else { query.clone() }
-                    }
-                ],
+                        "title": format!("/{} — {}", cmd.command, bot_prof.bot.display_name),
+                        "description": cmd.description,
+                        "messageText": format!("/{} {}", cmd.command, query).trim().to_string()
+                    }));
+                }
+            }
+            for app in &apps {
+                if app.bot_username.eq_ignore_ascii_case(clean) || q_lower.is_empty() || app.title.to_lowercase().contains(&q_lower) {
+                    results.push(json!({
+                        "id": format!("app_{}_{}", app.bot_username, app.short_name),
+                        "type": "web_app",
+                        "title": app.title,
+                        "description": app.description,
+                        "url": format!("gpui-miniapp://{}/{}", app.bot_username, app.short_name)
+                    }));
+                }
+            }
+            if results.is_empty() {
+                results.push(json!({
+                    "id": format!("bot_{}_profile", bot_prof.bot.bot_user_id),
+                    "type": "article",
+                    "title": bot_prof.bot.display_name,
+                    "description": bot_prof.bot.description,
+                    "messageText": if query.is_empty() { bot_prof.bot.description.clone() } else { query.clone() }
+                }));
+            }
+            Ok(json!({
+                "botId": bot_prof.bot.bot_user_id,
+                "botUsername": bot_prof.bot.username,
+                "query": query,
+                "results": results,
                 "matchingMiniApps": apps
             }))
         }
@@ -324,21 +365,18 @@ pub async fn handle_miniapps(
             let bot_username = req_str(payload, &["botUsername", "bot_username"], "botUsername")?;
             let short_name = req_str(payload, &["shortName", "short_name"], "shortName")?;
             let title = opt_str(payload, &["title", "name"]).unwrap_or_else(|| short_name.clone());
-            let url = opt_str(payload, &["url", "webAppUrl"])
+            let url = opt_str(payload, &["webUrl", "web_url", "url", "webAppUrl"])
                 .unwrap_or_else(|| format!("gpui-miniapp://{bot_username}/{short_name}"));
-            let mut map = serde_json::Map::new();
-            map.insert("bot_username".into(), Value::String(bot_username));
-            map.insert("short_name".into(), Value::String(short_name));
-            map.insert("title".into(), Value::String(title));
-            map.insert("url".into(), Value::String(url.clone()));
-            map.insert("web_app_url".into(), Value::String(url));
-            if let Some(desc) = opt_str(payload, &["description", "about"]) {
-                map.insert("description".into(), Value::String(desc));
-            }
-            if let Some(cat) = opt_str(payload, &["category"]) {
-                map.insert("category".into(), Value::String(cat));
-            }
-            let req: CreateMiniAppRequest = serde_json::from_value(Value::Object(map))?;
+            let req = CreateMiniAppRequest {
+                bot_username: bot_username.trim_start_matches('@').to_string(),
+                short_name,
+                title,
+                description: opt_str(payload, &["description", "about"]).unwrap_or_default(),
+                category: opt_str(payload, &["category"]).unwrap_or_else(|| "utilities".into()),
+                icon_emoji: opt_str(payload, &["iconEmoji", "icon_emoji"]).unwrap_or_else(|| "🧩".into()),
+                web_url: Some(url),
+                ..CreateMiniAppRequest::default()
+            };
             to_json_val(client.create_mini_app(&req).await?)
         }
         "uploadWasm" => {
@@ -600,39 +638,42 @@ pub async fn handle_fabushi(
             let token = client
                 .token()
                 .ok_or_else(|| CoreDispatchError::unauthorized("No active session token"))?;
-            let to_country = opt_str(payload, &["toCountry", "target_country", "countryCode"])
+            let to_country = opt_str(payload, &["toCountry", "targetCountry", "target_country", "countryCode"])
                 .unwrap_or_else(|| "JP".into());
-            if country_by_code(&to_country).is_none() {
+            if to_country != "ALL" && country_by_code(&to_country).is_none() {
                 return Err(CoreDispatchError::validation(format!(
                     "Invalid target ISO country code '{to_country}'"
                 )));
             }
-            let sutra_title = opt_str(payload, &["sutraTitle", "sutra_title", "title"])
+            let sutra_title = opt_str(payload, &["contentTitle", "content_title", "sutraTitle", "sutra_title", "title"])
                 .unwrap_or_else(|| "金刚经".into());
             let sutra = sutra_by_title(&sutra_title).unwrap_or_else(|| &all_sutras()[0]);
-            let count = opt_u64(payload, &["count", "copies"]).unwrap_or(1).max(1);
-            let bytes_offered = (sutra.content.len() as u64).saturating_mul(count);
-            let mut body = payload.as_object().cloned().unwrap_or_default();
-            body.entry("target_country".to_string())
-                .or_insert_with(|| Value::String(to_country.clone()));
-            body.entry("country_code".to_string())
-                .or_insert_with(|| Value::String(to_country));
-            body.entry("sutra_title".to_string())
-                .or_insert_with(|| Value::String(sutra.title.clone()));
-            body.entry("bytes".to_string())
-                .or_insert_with(|| json!(bytes_offered));
-            body.entry("size_bytes".to_string())
-                .or_insert_with(|| json!(bytes_offered));
-            body.entry("count".to_string()).or_insert_with(|| json!(count));
-            let res: Value = client
+            let count = opt_u64(payload, &["beamCount", "beam_count", "count", "copies"]).unwrap_or(1).max(1);
+            let bytes_offered = opt_u64(payload, &["bytesSent", "bytes_sent", "bytes"])
+                .unwrap_or_else(|| (sutra.content.len() as u64).saturating_mul(count));
+            let kind = opt_str(payload, &["contentKind", "content_kind", "offeringType", "kind"])
+                .unwrap_or_else(|| "sutra".into());
+            let req_body = json!({
+                "content_title": sutra.title,
+                "content_kind": kind,
+                "target_countries": [to_country],
+                "bytes_sent": bytes_offered,
+                "beam_count": count as u32
+            });
+            let mut res: Value = client
                 .http_client
                 .request_json(
                     reqwest::Method::POST,
                     "/api/v1/miniapps/fabushi/transfer",
                     Some(&token),
-                    Some(&Value::Object(body)),
+                    Some(&req_body),
                 )
                 .await?;
+            let merit_gained = (count.saturating_mul(10)).max(10);
+            res["merit_gained"] = json!(merit_gained);
+            res["meritGained"] = json!(merit_gained);
+            res["bytesOffered"] = json!(bytes_offered);
+            res["targetCountry"] = json!(to_country);
             Ok(res)
         }
         "recordMeditation" => {
@@ -640,30 +681,28 @@ pub async fn handle_fabushi(
                 .token()
                 .ok_or_else(|| CoreDispatchError::unauthorized("No active session token"))?;
             let duration_secs = opt_u64(payload, &["durationSeconds", "duration_seconds", "seconds"])
-                .unwrap_or(600);
+                .unwrap_or_else(|| opt_u64(payload, &["durationMinutes", "duration_minutes"]).unwrap_or(10) * 60);
             if duration_secs == 0 {
                 return Err(CoreDispatchError::validation("durationSeconds must be > 0"));
             }
-            let subject = opt_str(payload, &["subject", "sutraTitle", "practiceType"])
+            let duration_mins = ((duration_secs + 59) / 60).max(1) as u32;
+            let subject = opt_str(payload, &["sutra", "sutraName", "sutra_name", "subject", "sutraTitle", "practiceType"])
                 .unwrap_or_else(|| "禅定静坐".into());
-            let count = opt_u64(payload, &["count", "chantCount"]).unwrap_or(1);
-            let mut body = payload.as_object().cloned().unwrap_or_default();
-            body.entry("subject".to_string())
-                .or_insert_with(|| Value::String(subject.clone()));
-            body.entry("title".to_string())
-                .or_insert_with(|| Value::String(subject));
-            body.entry("duration_seconds".to_string())
-                .or_insert_with(|| json!(duration_secs));
-            body.entry("minutes".to_string())
-                .or_insert_with(|| json!((duration_secs / 60).max(1)));
-            body.entry("count".to_string()).or_insert_with(|| json!(count));
+            let count = opt_u64(payload, &["chantCount", "chant_count", "count"]).unwrap_or(1) as u32;
+            let notes = opt_str(payload, &["notes", "dedication"]);
+            let req_body = json!({
+                "sutra": subject,
+                "duration_minutes": duration_mins,
+                "chant_count": count,
+                "notes": notes
+            });
             let res: Value = client
                 .http_client
                 .request_json(
                     reqwest::Method::POST,
-                    "/api/v1/miniapps/fabushi/practice/record",
+                    "/api/v1/miniapps/fabushi/practice/session",
                     Some(&token),
-                    Some(&Value::Object(body)),
+                    Some(&req_body),
                 )
                 .await?;
             Ok(res)
@@ -704,15 +743,12 @@ pub async fn handle_fabushi(
                 .http_client
                 .request_json(
                     reqwest::Method::POST,
-                    "/api/v1/miniapps/fabushi/practice/record",
+                    "/api/v1/miniapps/fabushi/practice/session",
                     Some(&token),
                     Some(&json!({
-                        "subject": sutra.title,
-                        "title": sutra.title,
-                        "category": sutra.category,
-                        "count": 1,
-                        "duration_seconds": 300,
-                        "minutes": 5
+                        "sutra": sutra.title,
+                        "chant_count": 1,
+                        "duration_minutes": 5
                     })),
                 )
                 .await?;
@@ -728,11 +764,14 @@ pub async fn handle_fabushi(
             let token = client
                 .token()
                 .ok_or_else(|| CoreDispatchError::unauthorized("No active session token"))?;
+            let kind = opt_str(payload, &["kind"]).unwrap_or_else(|| "global".into());
+            let limit = opt_u64(payload, &["limit"]).unwrap_or(50).clamp(1, 100);
+            let path = format!("/api/v1/miniapps/fabushi/leaderboard?kind={kind}&limit={limit}");
             client
                 .http_client
                 .request_json(
                     reqwest::Method::GET,
-                    "/api/v1/miniapps/fabushi/leaderboard",
+                    &path,
                     Some(&token),
                     None::<&()>,
                 )
@@ -744,18 +783,13 @@ pub async fn handle_fabushi(
                 .token()
                 .ok_or_else(|| CoreDispatchError::unauthorized("No active session token"))?;
             let plan = opt_str(payload, &["plan", "planId", "tier"]).unwrap_or_else(|| "monthly".into());
-            let mut body = payload.as_object().cloned().unwrap_or_default();
-            body.entry("plan".to_string())
-                .or_insert_with(|| Value::String(plan.clone()));
-            body.entry("plan_id".to_string())
-                .or_insert_with(|| Value::String(plan));
             client
                 .http_client
                 .request_json(
                     reqwest::Method::POST,
                     "/api/v1/miniapps/fabushi/membership",
                     Some(&token),
-                    Some(&Value::Object(body)),
+                    Some(&json!({ "plan": plan })),
                 )
                 .await
                 .map_err(Into::into)
@@ -765,18 +799,14 @@ pub async fn handle_fabushi(
                 .token()
                 .ok_or_else(|| CoreDispatchError::unauthorized("No active session token"))?;
             let msg = req_str(payload, &["message", "prompt", "text"], "message")?;
-            let mut body = payload.as_object().cloned().unwrap_or_default();
-            body.entry("message".to_string())
-                .or_insert_with(|| Value::String(msg.clone()));
-            body.entry("prompt".to_string())
-                .or_insert_with(|| Value::String(msg));
+            let history = payload.get("history").cloned().unwrap_or_else(|| json!([]));
             client
                 .http_client
                 .request_json(
                     reqwest::Method::POST,
                     "/api/v1/miniapps/fabushi/ai-chat",
                     Some(&token),
-                    Some(&Value::Object(body)),
+                    Some(&json!({ "message": msg, "history": history })),
                 )
                 .await
                 .map_err(Into::into)

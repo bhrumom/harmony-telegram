@@ -307,24 +307,15 @@ pub async fn handle_settings(
             }))
         }
         "updateProfile" => {
-            let mut map = serde_json::Map::new();
-            if let Some(fnm) = opt_str(payload, &["firstName", "first_name"]) {
-                map.insert("first_name".into(), Value::String(fnm));
-            }
-            if let Some(lnm) = opt_str(payload, &["lastName", "last_name"]) {
-                map.insert("last_name".into(), Value::String(lnm));
-            }
-            if let Some(bio) = opt_str(payload, &["bio", "about"]) {
-                map.insert("bio".into(), Value::String(bio.clone()));
-                map.insert("about".into(), Value::String(bio));
-            }
-            if let Some(uname) = opt_str(payload, &["username"]) {
-                map.insert("username".into(), Value::String(uname));
-            }
-            if let Some(photo) = opt_str(payload, &["photoUrl", "photo_url", "avatarFileId"]) {
-                map.insert("photo_url".into(), Value::String(photo));
-            }
-            let req: ProtoUpdateProfileRequest = serde_json::from_value(Value::Object(map))?;
+            let req = ProtoUpdateProfileRequest {
+                first_name: opt_str(payload, &["firstName", "first_name"]),
+                last_name: opt_str(payload, &["lastName", "last_name"]),
+                username: opt_str(payload, &["username"]),
+                phone: opt_str(payload, &["phone", "phoneNumber"]),
+                bio: opt_str(payload, &["bio", "about"]),
+                avatar_media_id: opt_str(payload, &["avatarMediaId", "avatar_media_id", "photoUrl", "photo_url", "avatarFileId"]),
+                emoji_status: opt_str(payload, &["emojiStatus", "emoji_status"]),
+            };
             to_json_val(client.update_profile(&req).await?)
         }
         "getPrivacy" => to_json_val(client.get_my_settings().await?),
@@ -499,26 +490,20 @@ pub async fn handle_wallet(
         "sendStarGift" => {
             let to_uid = req_u64(
                 payload,
-                &["recipientUserId", "recipient_user_id", "toUserId", "userId"],
+                &["recipientUserId", "recipient_user_id", "toUserId", "to_user_id", "userId"],
                 "recipientUserId",
             )?;
-            let stars = req_i64(payload, &["amountStars", "stars", "amount"], "amountStars")?;
+            let stars = req_i64(payload, &["amountStars", "amount_stars", "stars", "amount"], "amountStars")?;
             if stars <= 0 {
                 return Err(CoreDispatchError::validation("Gift stars amount must be > 0"));
             }
-            let gift_id = opt_str(payload, &["giftId", "gift_id"]).unwrap_or_else(|| "star_rose".into());
-            let msg = opt_str(payload, &["message", "text"]);
-            let mut map = serde_json::Map::new();
-            map.insert("recipient_user_id".into(), json!(to_uid));
-            map.insert("to_user_id".into(), json!(to_uid));
-            map.insert("user_id".into(), json!(to_uid));
-            map.insert("amount_stars".into(), json!(stars));
-            map.insert("stars".into(), json!(stars));
-            map.insert("gift_id".into(), Value::String(gift_id));
-            if let Some(m) = msg {
-                map.insert("message".into(), Value::String(m));
-            }
-            let req: StarGiftRequest = serde_json::from_value(Value::Object(map))?;
+            let req = StarGiftRequest {
+                to_user_id: to_uid,
+                chat_id: opt_i64(payload, &["chatId", "chat_id"]),
+                amount_stars: stars,
+                gift_id: Some(opt_str(payload, &["giftId", "gift_id"]).unwrap_or_else(|| "star_rose".into())),
+                message: opt_str(payload, &["message", "text"]),
+            };
             to_json_val(client.wallet_gift_stars(&req).await?)
         }
         "redeemCode" => {
@@ -536,6 +521,51 @@ pub async fn handle_wallet(
                 )
                 .await?;
             Ok(res)
+        }
+        "createTonWallet" => {
+            let acct_id = opt_str(payload, &["accountId", "account_id"]).unwrap_or_else(|| "ton_primary".into());
+            let addr = opt_str(payload, &["address"]).unwrap_or_else(|| {
+                format!("UQ{}", &sha256_hex(acct_id.as_bytes())[..46])
+            });
+            let label = opt_str(payload, &["label"]).unwrap_or_else(|| "HarmonyOS TON Vault".into());
+            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            let created = engine
+                .ton_service
+                .create_new_wallet(&acct_id, &addr, &label, now)
+                .await
+                .map_err(|e| CoreDispatchError::internal(e.to_string()))?;
+            let updated = engine.with_state_mut(|st| {
+                st.ton_wallet["activeAccountId"] = Value::String(created.account_id.clone());
+                st.ton_wallet["address"] = Value::String(created.address.clone());
+                st.ton_wallet["label"] = Value::String(created.label.clone());
+                st.ton_wallet["balanceNanotons"] = json!(engine.ton_service.get_cached_balance_nanotons());
+                st.ton_wallet.clone()
+            })?;
+            Ok(updated)
+        }
+        "sendTon" => {
+            let send_nanos = req_u64(payload, &["sendAmountNanotons", "amountNanotons", "amount"], "amountNanotons")?;
+            let recipient = req_str(payload, &["recipientAddress", "recipient"], "recipientAddress")?;
+            let fee = opt_u64(payload, &["feeNanotons"]).unwrap_or(5_000_000);
+            let tx_hash = engine
+                .ton_service
+                .send_transfer(&recipient, send_nanos, fee)
+                .await
+                .map_err(|e| CoreDispatchError::validation(e.to_string()))?;
+            let new_bal = engine.ton_service.get_cached_balance_nanotons();
+            let updated = engine.with_state_mut(|st| {
+                st.ton_wallet["balanceNanotons"] = json!(new_bal);
+                if let Some(arr) = st.ton_wallet["transactions"].as_array_mut() {
+                    arr.push(json!({
+                        "txHash": tx_hash,
+                        "recipient": recipient,
+                        "amountNanotons": send_nanos,
+                        "feeNanotons": fee
+                    }));
+                }
+                st.ton_wallet.clone()
+            })?;
+            Ok(updated)
         }
         "getTonWalletState" => {
             if opt_bool(payload, &["createIfMissing", "create"]).unwrap_or(false) {
@@ -620,6 +650,7 @@ pub async fn handle_passport(
         "getPassportState" => {
             let ctrl = engine.load_passport_controller()?;
             Ok(json!({
+                "count": ctrl.form.values.len(),
                 "values": ctrl.form.values,
                 "requestedGroups": ctrl.form.requested_groups,
                 "canSubmit": ctrl.can_submit(),

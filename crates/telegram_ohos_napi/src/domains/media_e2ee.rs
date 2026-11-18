@@ -83,23 +83,16 @@ pub async fn handle_media(
             }
             let filename = opt_str(payload, &["filename", "fileName"])
                 .unwrap_or_else(|| "chunked.bin".into());
-            let mime = opt_str(payload, &["mimeType", "mime_type"])
+            let _mime = opt_str(payload, &["mimeType", "mime_type"])
                 .unwrap_or_else(|| "application/octet-stream".into());
             let part_size = opt_u32(payload, &["partSize", "part_size", "chunkSize"])
                 .unwrap_or_else(|| recommend_part_size(total_size) as u32);
-            let total_parts = ((total_size + (part_size as u64) - 1) / (part_size as u64)).max(1) as u32;
-            let mut map = serde_json::Map::new();
-            map.insert("filename".into(), Value::String(filename));
-            map.insert("mime_type".into(), Value::String(mime));
-            map.insert("total_size".into(), json!(total_size));
-            map.insert("size_bytes".into(), json!(total_size));
-            map.insert("part_size".into(), json!(part_size));
-            map.insert("chunk_size".into(), json!(part_size));
-            map.insert("total_parts".into(), json!(total_parts));
-            if let Some(sha) = opt_str(payload, &["sha256", "expectedSha256"]) {
-                map.insert("sha256".into(), Value::String(sha));
-            }
-            let req: ChunkedUploadInitRequest = serde_json::from_value(Value::Object(map))?;
+            let req = ChunkedUploadInitRequest {
+                size_bytes: total_size,
+                filename,
+                chunk_size: Some(part_size),
+                expected_sha256: opt_str(payload, &["sha256", "expectedSha256", "expected_sha256"]),
+            };
             to_json_val(client.http_client.init_chunked_upload(&token, &req).await?)
         }
         "uploadChunk" => {
@@ -174,11 +167,28 @@ pub async fn handle_media(
             Ok(json!({
                 "fileId": file_id,
                 "statusCode": status,
+                "httpStatus": status,
+                "isPartialContent": status == 206,
                 "contentRange": content_range,
                 "byteLength": bytes.len(),
                 "sha256": sha256_hex(&bytes),
                 "dataBase64": b64_encode(&bytes)
             }))
+        }
+        "getMetadata" => {
+            let file_id = req_str(payload, &["fileId", "file_id"], "fileId")?;
+            let token = client
+                .token()
+                .ok_or_else(|| CoreDispatchError::unauthorized("No active session token"))?;
+            let path = format!(
+                "/api/v1/media/{}/meta",
+                gpui_telegram_client::net::http_client::percent_encode_rfc3986(&file_id)
+            );
+            client
+                .http_client
+                .request_json(reqwest::Method::GET, &path, Some(&token), None::<&()>)
+                .await
+                .map_err(Into::into)
         }
         "encodeWaveform5Bit" => {
             let packed = if let Some(bars_arr) = payload.get("bars").and_then(|v| v.as_array()) {
@@ -593,10 +603,26 @@ pub async fn handle_e2ee(
             let digest = sha256_hex(format!("{}:{}", canonical[0], canonical[1]).as_bytes());
             Ok(json!({
                 "emojis": emojis,
+                "emojiFingerprint": emojis,
                 "numericFingerprint": &digest[..32],
                 "localX25519PublicKeyB64": b64_encode(&local_id.x25519_pub),
                 "remoteX25519PublicKeyB64": remote_b64
             }))
+        }
+        "revokeDevice" => {
+            let device_id = req_str(payload, &["deviceId", "device_id"], "deviceId")?;
+            let token = client
+                .token()
+                .ok_or_else(|| CoreDispatchError::unauthorized("No active session token"))?;
+            let path = format!(
+                "/api/v1/e2ee/devices/{}",
+                gpui_telegram_client::net::http_client::percent_encode_rfc3986(&device_id)
+            );
+            client
+                .http_client
+                .request_empty(reqwest::Method::DELETE, &path, Some(&token), None::<&()>)
+                .await?;
+            Ok(json!({ "revoked": true, "deviceId": device_id }))
         }
         other => Err(CoreDispatchError::new(
             "UNKNOWN_ACTION",

@@ -5500,6 +5500,42 @@ pub async fn bots_block(
         .into_response()
 }
 
+/// POST /api/v1/bots/{bot_id}/regenerate-token
+pub async fn bots_regenerate_token(
+    auth: AuthBearer,
+    State(state): State<Arc<AppState>>,
+    Path(bot_id): Path<i64>,
+) -> Response {
+    let Some(bot) = state.db.get_bot_by_user_id(bot_id).ok().flatten() else {
+        return err_resp(StatusCode::NOT_FOUND, "bot_not_found", "Bot not found");
+    };
+    if bot.owner_user_id != auth.user_id.0 as i64 {
+        return err_resp(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Only the bot owner can regenerate its Bot API token",
+        );
+    }
+    let updated = match state.db.regenerate_bot_token(bot_id) {
+        Ok(rec) => rec,
+        Err(e) => return map_telegram_err(e),
+    };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "regenerated": true,
+            "bot_id": updated.bot_user_id,
+            "botId": updated.bot_user_id,
+            "username": updated.username,
+            "bot_token": updated.bot_token,
+            "botToken": updated.bot_token,
+            "token": updated.bot_token,
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

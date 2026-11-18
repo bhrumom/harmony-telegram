@@ -26,12 +26,16 @@ pub const VALID_NAV_TABS: &[&str] = &[
     "calls",
     "talk",
     "bots",
+    "miniapps",
     "fabushi",
     "hermes",
     "tasks",
     "mcp",
+    "magpie",
     "computer",
     "computers",
+    "wallet",
+    "passport",
     "saved",
     "settings",
 ];
@@ -43,10 +47,10 @@ pub fn normalize_theme_id(raw: &str) -> CoreResult<String> {
         "classic" | "Classic" => Ok("classic".to_string()),
         "classicDay" | "classic_day" | "light" => Ok("classicDay".to_string()),
         "classicNight" | "classic_night" | "dark" => Ok("classicNight".to_string()),
-        "tinted" | "Tinted" => Ok("tinted".to_string()),
+        "tinted" | "Tinted" | "night_blue" | "nightBlue" => Ok("tinted".to_string()),
         "arctic" | "Arctic" => Ok("arctic".to_string()),
         other => Err(CoreDispatchError::validation(format!(
-            "Unsupported themeId '{other}'; expected one of night, tinted, day, classic"
+            "Unsupported themeId '{other}'; expected one of classicDay, classicNight, tinted, arctic, day, night, classic"
         ))),
     }
 }
@@ -71,7 +75,7 @@ pub fn compute_breakpoint(width_vp: i64) -> CoreResult<(&'static str, u8, &'stat
         Ok(("sm", 1, "phone_stack"))
     } else if width_vp < 840 {
         Ok(("md", 2, "foldable_split"))
-    } else if width_vp < 1280 {
+    } else if width_vp < 1200 {
         Ok(("lg", 3, "tablet_triple_overlay"))
     } else {
         Ok(("xl", 4, "2in1_quad_docked"))
@@ -80,8 +84,8 @@ pub fn compute_breakpoint(width_vp: i64) -> CoreResult<(&'static str, u8, &'stat
 
 pub fn theme_palette(theme_id: &str) -> Value {
     match theme_id {
-        "classicDay" => json!({
-            "id": "classicDay",
+        "classicDay" | "day" => json!({
+            "id": theme_id,
             "isDark": false,
             "windowBg": "#FFFFFF",
             "surfaceBg": "#F4F4F5",
@@ -90,8 +94,18 @@ pub fn theme_palette(theme_id: &str) -> Value {
             "msgInBg": "#FFFFFF",
             "textPrimary": "#111827"
         }),
-        "classicNight" => json!({
-            "id": "classicNight",
+        "classic" => json!({
+            "id": "classic",
+            "isDark": false,
+            "windowBg": "#FFFFFF",
+            "surfaceBg": "#F1F3F4",
+            "accent": "#3390EC",
+            "msgOutBg": "#EFFDDE",
+            "msgInBg": "#FFFFFF",
+            "textPrimary": "#0F172A"
+        }),
+        "classicNight" | "night" => json!({
+            "id": theme_id,
             "isDark": true,
             "windowBg": "#0E1621",
             "surfaceBg": "#17212B",
@@ -128,13 +142,19 @@ pub fn localized_labels(locale: &str) -> Value {
         json!({
             "appName": "法布施 Telegram",
             "chats": "对话",
+            "folders": "分组",
             "contacts": "联系人",
             "calls": "通话",
+            "talk": "AI 语音对讲",
             "bots": "机器人与小程序",
             "fabushi": "全球法布施",
             "hermes": "Hermes 智能体",
             "tasks": "任务与看板",
+            "mcp": "MCP 工具集",
+            "magpie": "喜鹊 AI 网关",
             "computers": "远程电脑",
+            "wallet": "钱包与星币",
+            "passport": "加密护照",
             "settings": "设置",
             "searchPlaceholder": "全局搜索消息、对话与智能体…"
         })
@@ -142,13 +162,19 @@ pub fn localized_labels(locale: &str) -> Value {
         json!({
             "appName": "Fabushi Telegram",
             "chats": "Chats",
+            "folders": "Folders",
             "contacts": "Contacts",
             "calls": "Calls",
+            "talk": "AI Live Talk",
             "bots": "Bots & MiniApps",
             "fabushi": "Global Fabushi",
             "hermes": "Hermes Studio",
             "tasks": "Tasks & Kanban",
+            "mcp": "MCP Registry",
+            "magpie": "Magpie Gateway",
             "computers": "Computers",
+            "wallet": "Stars & TON Wallet",
+            "passport": "Passport Vault",
             "settings": "Settings",
             "searchPlaceholder": "Search messages, chats, and agents…"
         })
@@ -257,7 +283,7 @@ pub fn run_ui_session(engine: &TelegramCoreEngine, script: &Value) -> CoreResult
                 ui.breakpoint = bp.to_string();
                 ui.visible_columns = cols;
                 ui.layout_mode = mode.to_string();
-                ui.freeform_window = width >= 1280;
+                ui.freeform_window = width >= 1200;
                 if bp == "xl" {
                     ui.inspector_open = true;
                 } else if bp == "sm" {
@@ -502,6 +528,19 @@ pub fn run_ui_session(engine: &TelegramCoreEngine, script: &Value) -> CoreResult
                     "uri": uri,
                     "activeNav": ui.active_nav
                 })
+            }
+            "openChat" | "selectChat" => {
+                let cid = opt_i64(step, &["chatId", "chat_id"]).ok_or_else(|| {
+                    CoreDispatchError::validation("openChat requires chatId")
+                })?;
+                ui.active_nav = "chats".to_string();
+                ui.active_chat_id = Some(cid);
+                ui.active_topic_id = opt_i64(step, &["topicId", "topic_id"]);
+                json!({ "step": idx, "op": op, "activeChatId": ui.active_chat_id, "activeTopicId": ui.active_topic_id })
+            }
+            "setComposerDraft" | "typeComposer" => {
+                ui.composer_draft = opt_str(step, &["text", "draft"]).unwrap_or_default();
+                json!({ "step": idx, "op": op, "composerDraft": ui.composer_draft })
             }
             "sleepMs" => {
                 let ms = opt_i64(step, &["ms"]).unwrap_or(50).clamp(1, 5_000) as u64;

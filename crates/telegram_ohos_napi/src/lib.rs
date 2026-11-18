@@ -43,15 +43,20 @@ mod ohos_napi_bindings {
     }
 
     #[napi(object)]
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Default)]
     pub struct SandboxInitConfig {
-        pub files_dir: String,
-        pub cache_dir: String,
-        pub temp_dir: String,
-        pub database_dir: String,
-        pub resource_dir: String,
-        pub ca_cert_path: String,
-        pub default_server_url: String,
+        pub files_dir: Option<String>,
+        pub cache_dir: Option<String>,
+        pub temp_dir: Option<String>,
+        pub database_dir: Option<String>,
+        pub resource_dir: Option<String>,
+        pub ca_cert_path: Option<String>,
+        pub default_server_url: Option<String>,
+        pub server_url: Option<String>,
+        pub app_version: Option<String>,
+        pub device_model: Option<String>,
+        pub os_full_name: Option<String>,
+        pub locale: Option<String>,
     }
 
     #[napi(object)]
@@ -62,6 +67,15 @@ mod ohos_napi_bindings {
         pub error_code: String,
         pub error_message: String,
         pub generation: u32,
+    }
+
+    #[napi(object)]
+    #[derive(Debug, Clone)]
+    pub struct CorePushEvent {
+        pub generation: u32,
+        pub account_id: String,
+        pub kind: String,
+        pub payload_json: String,
     }
 
     pub struct InitCoreTask {
@@ -178,15 +192,23 @@ mod ohos_napi_bindings {
 
     #[napi(js_name = "initCore")]
     pub fn init_core(config: SandboxInitConfig) -> AsyncTask<InitCoreTask> {
+        let srv_url = config
+            .server_url
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| config.default_server_url.filter(|s| !s.trim().is_empty()))
+            .unwrap_or_default();
         let cfg = EngineInitConfig {
-            server_url: config.default_server_url,
-            files_dir: config.files_dir,
-            cache_dir: config.cache_dir,
-            temp_dir: config.temp_dir,
-            database_dir: config.database_dir,
-            resource_dir: config.resource_dir,
-            ca_cert_path: config.ca_cert_path,
-            ..EngineInitConfig::default()
+            server_url: srv_url,
+            files_dir: config.files_dir.unwrap_or_default(),
+            cache_dir: config.cache_dir.unwrap_or_default(),
+            temp_dir: config.temp_dir.unwrap_or_default(),
+            database_dir: config.database_dir.unwrap_or_default(),
+            resource_dir: config.resource_dir.unwrap_or_default(),
+            ca_cert_path: config.ca_cert_path.unwrap_or_default(),
+            app_version: config.app_version.unwrap_or_default(),
+            device_model: config.device_model.unwrap_or_default(),
+            os_full_name: config.os_full_name.unwrap_or_default(),
+            locale: config.locale.unwrap_or_default(),
         };
         AsyncTask::new(InitCoreTask {
             engine: Arc::clone(global_engine()),
@@ -215,6 +237,15 @@ mod ohos_napi_bindings {
         })
     }
 
+    #[napi(js_name = "invokeActionSync")]
+    pub fn invoke_action_sync(
+        domain: String,
+        action: String,
+        payload_json: String,
+    ) -> CoreResponseEnvelope {
+        dto_to_envelope(global_engine().invoke_envelope(&domain, &action, &payload_json))
+    }
+
     #[napi(
         js_name = "subscribeDomainEvents",
         ts_args_type = "callback: (eventJson: string) => void"
@@ -225,6 +256,26 @@ mod ohos_napi_bindings {
         let tsfn = Arc::new(callback);
         global_engine().set_event_sink(Arc::new(move |ev: CorePushEventDto| {
             let _ = tsfn.call(ev.payload_json, ThreadsafeFunctionCallMode::NonBlocking);
+        }));
+        true
+    }
+
+    #[napi(
+        js_name = "subscribePushEvents",
+        ts_args_type = "callback: (event: CorePushEvent) => void"
+    )]
+    pub fn subscribe_push_events(
+        callback: ThreadsafeFunction<CorePushEvent, (), CorePushEvent, Status, false>,
+    ) -> bool {
+        let tsfn = Arc::new(callback);
+        global_engine().set_event_sink(Arc::new(move |ev: CorePushEventDto| {
+            let pev = CorePushEvent {
+                generation: ev.generation,
+                account_id: ev.account_id,
+                kind: ev.kind,
+                payload_json: ev.payload_json,
+            };
+            let _ = tsfn.call(pev, ThreadsafeFunctionCallMode::NonBlocking);
         }));
         true
     }

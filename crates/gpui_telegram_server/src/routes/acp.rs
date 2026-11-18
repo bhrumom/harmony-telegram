@@ -229,32 +229,104 @@ pub async fn mcp_servers_list(_auth: AuthBearer, State(state): State<Arc<AppStat
     Json(json!({ "servers": servers, "registered_tools_count": tools.len() }))
 }
 
+fn parse_tool_risk_level(raw: Option<&str>) -> gpui_telegram_agent::ToolRiskLevel {
+    match raw.unwrap_or("low").trim().to_ascii_lowercase().as_str() {
+        "read_only" | "readonly" => gpui_telegram_agent::ToolRiskLevel::ReadOnly,
+        "medium" => gpui_telegram_agent::ToolRiskLevel::Medium,
+        "high" => gpui_telegram_agent::ToolRiskLevel::High,
+        "critical" | "destructive" | "critical_destructive" => {
+            gpui_telegram_agent::ToolRiskLevel::CriticalDestructive
+        }
+        _ => gpui_telegram_agent::ToolRiskLevel::Low,
+    }
+}
+
 pub async fn mcp_servers_register(_auth: AuthBearer, State(state): State<Arc<AppState>>, Json(payload): Json<Value>) -> Response {
-    let server_id = payload.get("server_id").and_then(|v| v.as_str()).unwrap_or("default");
+    let server_id = payload
+        .get("server_id")
+        .or_else(|| payload.get("serverId"))
+        .or_else(|| payload.get("id"))
+        .or_else(|| payload.get("name"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("default");
     let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or(server_id);
-    let endpoint = payload.get("endpoint").and_then(|v| v.as_str()).unwrap_or("stdio://local");
+    let endpoint = payload.get("endpoint").or_else(|| payload.get("url")).and_then(|v| v.as_str()).unwrap_or("stdio://local");
     let mut reg_tools = Vec::new();
-    if let Some(tool_name) = payload.get("tool_name").and_then(|v| v.as_str()) {
+    if let Some(tool_name) = payload.get("tool_name").or_else(|| payload.get("toolName")).and_then(|v| v.as_str()) {
         let desc = payload.get("description").and_then(|v| v.as_str()).unwrap_or("");
         let schema = payload.get("schema").and_then(|v| v.as_str()).unwrap_or("{}");
-        let def = gpui_telegram_agent::McpToolDefinition::new(tool_name, desc, schema, gpui_telegram_agent::ToolRiskLevel::Low).with_server_id(server_id);
+        let risk = parse_tool_risk_level(payload.get("risk_level").or_else(|| payload.get("riskLevel")).and_then(|v| v.as_str()));
+        let def = gpui_telegram_agent::McpToolDefinition::new(tool_name, desc, schema, risk).with_server_id(server_id);
         reg_tools.push(serde_json::to_value(&def).unwrap_or(Value::Null));
         state.mcp_registry.write().register(def);
     }
-    let _ = state.db.upsert_mcp_server(server_id, name, endpoint, "connected", &Value::Array(reg_tools));
-    (StatusCode::CREATED, Json(json!({ "status": "registered", "server_id": server_id }))).into_response()
+    if let Some(tools_arr) = payload.get("tools").and_then(|v| v.as_array()) {
+        for item in tools_arr {
+            if let Some(tname) = item.get("name").or_else(|| item.get("tool_name")).or_else(|| item.get("toolName")).and_then(|v| v.as_str()) {
+                let desc = item.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                let schema_str = match item.get("schema").or_else(|| item.get("input_schema")).or_else(|| item.get("inputSchema")) {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(v) => v.to_string(),
+                    None => "{}".to_string(),
+                };
+                let risk = parse_tool_risk_level(item.get("risk_level").or_else(|| item.get("riskLevel")).and_then(|v| v.as_str()));
+                let mut def = gpui_telegram_agent::McpToolDefinition::new(tname, desc, schema_str, risk).with_server_id(server_id);
+                if let Some(explicit_req) = item.get("requires_approval").or_else(|| item.get("requiresApproval")).and_then(|v| v.as_bool()) {
+                    def.requires_approval = explicit_req;
+                }
+                reg_tools.push(serde_json::to_value(&def).unwrap_or(Value::Null));
+                state.mcp_registry.write().register(def);
+            }
+        }
+    }
+    let _ = state.db.upsert_mcp_server(server_id, name, endpoint, "connected", &Value::Array(reg_tools.clone()));
+    (StatusCode::CREATED, Json(json!({ "status": "registered", "server_id": server_id, "name": name, "endpoint": endpoint, "tools_registered": reg_tools.len() }))).into_response()
 }
 
 pub async fn computer_lease_acquire(auth: AuthBearer, State(state): State<Arc<AppState>>, Json(payload): Json<Value>) -> Response {
-    let device_id = payload.get("device_id").and_then(|v| v.as_str()).unwrap_or("desktop_local");
-    let agent_id = format!("agent_{}", auth.user_id.raw());
-    match state.computer_lease_broker.write().acquire_lease(&agent_id, device_id) {
-        Some(lease) => {
+    let device_id = payload
+        .get("device_id")
+        .or_else(|| payload.get("deviceId"))
+        .or_else(|| payload.get("node_id"))
+        .or_else(|| payload.get("nodeId"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("desktop_local");
+    let default_agent = format!("agent_{}", auth.user_id.raw());
+    let agent_id = payload
+        .get("controller_id")
+        .or_else(|| payload.get("controllerId"))
+        .or_else(|| payload.get("agent_id"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(&default_agent);
+    match state.computer_lease_broker.write().acquire_lease(agent_id, device_id) {
+        Some(mut lease) => {
+            lease.holder_user_id = auth.user_id.0;
             let _ = state.db.upsert_computer_lease(&lease.lease_id, auth.user_id.0, Some(device_id), "active", &json!([]), Utc::now().timestamp_millis());
             (StatusCode::CREATED, Json(json!({ "status": "acquired", "lease": lease }))).into_response()
         }
         None => err_resp(StatusCode::CONFLICT, "lease_busy", "Control lease already held"),
     }
+}
+
+pub async fn computer_lease_release(auth: AuthBearer, State(state): State<Arc<AppState>>, Json(payload): Json<Value>) -> Response {
+    let mut broker = state.computer_lease_broker.write();
+    let explicit_id = payload
+        .get("lease_id")
+        .or_else(|| payload.get("leaseId"))
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let target_lease_id = explicit_id.or_else(|| broker.active_lease().map(|l| l.lease_id.clone()));
+    let Some(lid) = target_lease_id else {
+        return (StatusCode::OK, Json(json!({ "status": "released", "released": false }))).into_response();
+    };
+    let released = broker.release_lease(&lid);
+    drop(broker);
+    if released {
+        let _ = state.db.upsert_computer_lease(&lid, auth.user_id.0, None, "released", &json!([]), Utc::now().timestamp_millis());
+    }
+    (StatusCode::OK, Json(json!({ "status": "released", "released": released, "lease_id": lid }))).into_response()
 }
 
 pub async fn computer_lease_emergency_takeover(auth: AuthBearer, State(state): State<Arc<AppState>>) -> Json<Value> {

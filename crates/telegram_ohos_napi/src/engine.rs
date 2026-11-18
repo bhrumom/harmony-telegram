@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,8 +18,9 @@ use gpui_telegram_client::wallet::service::ton_wallet_service::TonWalletService;
 use gpui_telegram_client::TelegramClient;
 use gpui_telegram_core::passport::passport_form_controller::{FormRequest, PassportFormController};
 use gpui_telegram_core::types::ChatId;
+use gpui_telegram_client::ClientDomainEvent;
 #[allow(unused_imports)]
-use crate::rtc_media::{AiMediaTap, DefaultAiMediaTap};
+use crate::rtc_media::{AiMediaTap, DefaultAiMediaTap, SfuBridge};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use parking_lot::{Mutex, RwLock};
@@ -318,17 +319,20 @@ impl Default for TalkRuntime {
 
 pub struct TelegramCoreEngine {
     init_cfg: RwLock<EngineInitConfig>,
-    state: RwLock<PersistedOhosState>,
+    state: Arc<RwLock<PersistedOhosState>>,
     asset_vault: RwLock<AssetVaultStore>,
     client: RwLock<Option<Arc<TelegramClient>>>,
     pub ton_service: TonWalletService,
     pub talk: Mutex<TalkRuntime>,
+    pub sfu_bridge: Mutex<SfuBridge>,
     pub voice_recorders: Mutex<BTreeMap<String, gpui_telegram_media::VoiceRecorder>>,
-    generation: AtomicU32,
+    generation: Arc<AtomicU32>,
     initialized: AtomicBool,
-    event_sink: RwLock<Option<PushEventSink>>,
+    event_sink: Arc<RwLock<Option<PushEventSink>>>,
     event_broadcast: tokio::sync::broadcast::Sender<String>,
+    push_broadcast: tokio::sync::broadcast::Sender<CorePushEventDto>,
     ws_pump_stop: Arc<AtomicBool>,
+    ws_pump_epoch: Arc<AtomicU64>,
 }
 
 impl Default for TelegramCoreEngine {
@@ -343,9 +347,10 @@ impl TelegramCoreEngine {
         let mut init_vault_key = [0u8; 32];
         let _ = getrandom::getrandom(&mut init_vault_key);
         let (event_tx, _) = tokio::sync::broadcast::channel(512);
+        let (push_tx, _) = tokio::sync::broadcast::channel(512);
         Self {
             init_cfg: RwLock::new(EngineInitConfig::default()),
-            state: RwLock::new(PersistedOhosState::default()),
+            state: Arc::new(RwLock::new(PersistedOhosState::default())),
             asset_vault: RwLock::new(AssetVaultStore {
                 master_key_b64: b64_encode(&init_vault_key),
                 tokens_by_account: BTreeMap::new(),
@@ -353,12 +358,15 @@ impl TelegramCoreEngine {
             client: RwLock::new(None),
             ton_service: TonWalletService::new(),
             talk: Mutex::new(TalkRuntime::default()),
+            sfu_bridge: Mutex::new(SfuBridge::new()),
             voice_recorders: Mutex::new(BTreeMap::new()),
-            generation: AtomicU32::new(1),
+            generation: Arc::new(AtomicU32::new(1)),
             initialized: AtomicBool::new(false),
-            event_sink: RwLock::new(None),
+            event_sink: Arc::new(RwLock::new(None)),
             event_broadcast: event_tx,
+            push_broadcast: push_tx,
             ws_pump_stop: Arc::new(AtomicBool::new(false)),
+            ws_pump_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -394,17 +402,12 @@ impl TelegramCoreEngine {
             }
         }
 
-        if !cfg.temp_dir.trim().is_empty() {
-            unsafe {
-                std::env::set_var("TMPDIR", &cfg.temp_dir);
-            }
-        }
-        if !cfg.files_dir.trim().is_empty() {
-            unsafe {
-                std::env::set_var("GPUI_TELEGRAM_CONFIG_DIR", &cfg.files_dir);
-            }
-        }
-        if !cfg.ca_cert_path.trim().is_empty() && Path::new(&cfg.ca_cert_path).is_file() {
+        // Do not mutate process-global TMPDIR / GPUI_TELEGRAM_CONFIG_DIR env vars here so
+        // concurrent multi-engine instances remain strictly isolated in their own sandboxes.
+        if !cfg.ca_cert_path.trim().is_empty()
+            && Path::new(&cfg.ca_cert_path).is_file()
+            && std::env::var_os("SSL_CERT_FILE").is_none()
+        {
             unsafe {
                 std::env::set_var("SSL_CERT_FILE", &cfg.ca_cert_path);
             }
@@ -497,7 +500,6 @@ impl TelegramCoreEngine {
         self.rebuild_client_for_slot(&loaded.active_slot)?;
         self.initialized.store(true, Ordering::SeqCst);
         self.save_state()?;
-        self.spawn_ws_event_pump();
 
         Ok(json!({
             "initialized": true,
@@ -513,11 +515,15 @@ impl TelegramCoreEngine {
 
     pub fn shutdown(&self) -> CoreResult<Value> {
         self.ws_pump_stop.store(true, Ordering::SeqCst);
+        self.ws_pump_epoch.fetch_add(1, Ordering::SeqCst);
         self.voice_recorders.lock().clear();
         if let Some(client) = self.client.write().take() {
             client.outbox_worker().stop();
             client.stop_tailnet_mesh();
             client.disconnect_ws();
+            if tokio::runtime::Handle::try_current().is_ok() {
+                std::thread::spawn(move || drop(client));
+            }
         }
         let _ = self.save_state();
         self.initialized.store(false, Ordering::SeqCst);
@@ -533,58 +539,124 @@ impl TelegramCoreEngine {
 
     pub fn set_event_sink(&self, sink: PushEventSink) {
         *self.event_sink.write() = Some(sink);
-        self.spawn_ws_event_pump();
     }
 
-    fn spawn_ws_event_pump(&self) {
-        let Some(client) = self.client.read().clone() else {
-            return;
-        };
+    fn spawn_ws_event_pump_for_client(&self, client: Arc<TelegramClient>) {
         self.ws_pump_stop.store(false, Ordering::SeqCst);
+        let my_epoch = self.ws_pump_epoch.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+        let epoch_ref = Arc::clone(&self.ws_pump_epoch);
         let stop = Arc::clone(&self.ws_pump_stop);
-        let sink_opt = self.event_sink.read().clone();
+        let sink_lock = Arc::clone(&self.event_sink);
+        let state_lock = Arc::clone(&self.state);
+        let gen_atom = Arc::clone(&self.generation);
         let bcast = self.event_broadcast.clone();
-        let state_snapshot = self.state.read().active_account_id.clone().unwrap_or_default();
-        let current_gen = self.generation();
+        let push_bcast = self.push_broadcast.clone();
+        let mut outbox_rx = client.outbox_worker().subscribe_events();
+        let handle = client.runtime().handle().clone();
+        let weak_client = Arc::downgrade(&client);
+        drop(client);
 
-        let rt = Arc::clone(client.runtime());
-        rt.spawn(async move {
-            while !stop.load(Ordering::Relaxed) {
-                let events = client.poll_events();
-                for ev in events {
-                    let dbg = format!("{ev:?}");
-                    let kind = if dbg.starts_with("NewMessage")
-                        || dbg.starts_with("MessageUpdated")
-                        || dbg.starts_with("MessageDeleted")
-                        || dbg.starts_with("ReactionsUpdated")
-                        || dbg.starts_with("ReadHistory")
-                        || dbg.starts_with("SyncGapDetected")
-                    {
-                        "PtsUpdate"
-                    } else if dbg.starts_with("Typing") {
-                        "TypingUpdate"
-                    } else if dbg.starts_with("Connection") {
-                        "ConnectionState"
-                    } else if dbg.starts_with("CallUpdated") {
-                        "CallSignal"
-                    } else {
-                        "DomainEvent"
-                    };
+        handle.spawn(async move {
+            while !stop.load(Ordering::Relaxed) && epoch_ref.load(Ordering::Relaxed) == my_epoch {
+                let cur_gen = gen_atom.load(Ordering::SeqCst);
+                let cur_acct = state_lock
+                    .read()
+                    .active_account_id
+                    .clone()
+                    .unwrap_or_default();
+
+                while let Ok(ob_ev) = outbox_rx.try_recv() {
                     let ev_json = json!({
-                        "type": kind,
-                        "generation": current_gen,
-                        "accountId": state_snapshot,
-                        "summary": dbg
+                        "type": "OutboxState",
+                        "generation": cur_gen,
+                        "accountId": cur_acct,
+                        "payload": {
+                            "clientNonce": ob_ev.client_nonce,
+                            "chatId": ob_ev.chat_id,
+                            "status": format!("{:?}", ob_ev.status),
+                            "serverMessageId": ob_ev.server_message_id,
+                            "retryCount": ob_ev.retry_count,
+                            "lastError": ob_ev.last_error,
+                        }
                     });
                     let ev_str = ev_json.to_string();
                     let _ = bcast.send(ev_str.clone());
-                    if let Some(ref sink) = sink_opt {
-                        sink(CorePushEventDto {
-                            generation: current_gen,
-                            account_id: state_snapshot.clone(),
-                            kind: kind.to_string(),
-                            payload_json: ev_str,
-                        });
+                    let dto = CorePushEventDto {
+                        generation: cur_gen,
+                        account_id: cur_acct.clone(),
+                        kind: "OutboxState".to_string(),
+                        payload_json: ev_str,
+                    };
+                    let _ = push_bcast.send(dto.clone());
+                    if let Some(sink) = sink_lock.read().clone() {
+                        sink(dto);
+                    }
+                }
+
+                let events = if let Some(c) = weak_client.upgrade() {
+                    let evs = c.poll_events();
+                    if Arc::strong_count(&c) <= 1 {
+                        std::thread::spawn(move || drop(c));
+                    } else {
+                        drop(c);
+                    }
+                    evs
+                } else {
+                    break;
+                };
+                for ev in events {
+                    let (kind, payload_val) = match &ev {
+                        ClientDomainEvent::NewMessage(m) => (
+                            "PtsUpdate",
+                            json!({ "event": "NewMessage", "chatId": m.chat_id.0, "messageId": m.id.0 }),
+                        ),
+                        ClientDomainEvent::EditMessage(m) => (
+                            "PtsUpdate",
+                            json!({ "event": "MessageEdited", "chatId": m.chat_id.0, "messageId": m.id.0 }),
+                        ),
+                        ClientDomainEvent::DeleteMessages { chat_id, message_ids, .. } => (
+                            "PtsUpdate",
+                            json!({ "event": "MessageDeleted", "chatId": chat_id.0, "count": message_ids.len() }),
+                        ),
+                        ClientDomainEvent::ReactionsUpdated { chat_id, message_id, .. } => (
+                            "PtsUpdate",
+                            json!({ "event": "ReactionsUpdated", "chatId": chat_id.0, "messageId": message_id.0 }),
+                        ),
+                        ClientDomainEvent::ReadHistory { chat_id, max_id, .. } => (
+                            "PtsUpdate",
+                            json!({ "event": "ReadHistory", "chatId": chat_id.0, "maxId": max_id.0 }),
+                        ),
+                        ClientDomainEvent::SyncGapDetected { chat_id, from_pts, .. } => (
+                            "PtsUpdate",
+                            json!({ "event": "SyncGapDetected", "chatId": chat_id.0, "fromPts": from_pts }),
+                        ),
+                        ClientDomainEvent::Typing(t) => (
+                            "TypingUpdate",
+                            serde_json::to_value(t).unwrap_or_default(),
+                        ),
+                        ClientDomainEvent::CallUpdated { call_id, state, .. } => (
+                            "CallSignal",
+                            json!({ "callId": call_id, "state": state }),
+                        ),
+                        other => ("DomainEvent", json!({ "summary": format!("{other:?}") })),
+                    };
+                    let ev_json = json!({
+                        "type": kind,
+                        "generation": cur_gen,
+                        "accountId": cur_acct,
+                        "payload": payload_val
+                    });
+                    let ev_str = ev_json.to_string();
+                    let _ = bcast.send(ev_str.clone());
+                    let dto = CorePushEventDto {
+                        generation: cur_gen,
+                        account_id: cur_acct.clone(),
+                        kind: kind.to_string(),
+                        payload_json: ev_str,
+                    };
+                    let _ = push_bcast.send(dto.clone());
+                    if let Some(sink) = sink_lock.read().clone() {
+                        sink(dto);
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -608,14 +680,20 @@ impl TelegramCoreEngine {
         });
         let wrapped_str = wrapped.to_string();
         let _ = self.event_broadcast.send(wrapped_str.clone());
+        let dto = CorePushEventDto {
+            generation: cur_gen,
+            account_id: acct,
+            kind: kind.to_string(),
+            payload_json: wrapped_str,
+        };
+        let _ = self.push_broadcast.send(dto.clone());
         if let Some(sink) = self.event_sink.read().clone() {
-            sink(CorePushEventDto {
-                generation: cur_gen,
-                account_id: acct,
-                kind: kind.to_string(),
-                payload_json: wrapped_str,
-            });
+            sink(dto);
         }
+    }
+
+    pub fn subscribe_push(&self) -> tokio::sync::broadcast::Receiver<CorePushEventDto> {
+        self.push_broadcast.subscribe()
     }
 
     pub fn init_config(&self) -> EngineInitConfig {
@@ -718,17 +796,24 @@ impl TelegramCoreEngine {
                     created_at: None,
                     expires_at: None,
                 };
-                if snap.offline_mode {
-                    tg_client.local_store.bind_account_scope(&snap.server_url, auth.user_id);
-                    tg_client.set_token(Some(auth.token.clone()));
-                } else {
-                    tg_client.set_auth_session(auth);
+                tg_client.set_auth_session(auth);
+                if !snap.offline_mode {
+                    tg_client.connect_ws();
                 }
             }
         }
 
+        if let Some(prev) = self.client.write().take() {
+            prev.outbox_worker().stop();
+            prev.stop_tailnet_mesh();
+            prev.disconnect_ws();
+            if tokio::runtime::Handle::try_current().is_ok() {
+                std::thread::spawn(move || drop(prev));
+            }
+        }
         let arc = Arc::new(tg_client);
         *self.client.write() = Some(Arc::clone(&arc));
+        self.spawn_ws_event_pump_for_client(Arc::clone(&arc));
         Ok(arc)
     }
 
@@ -839,11 +924,18 @@ impl TelegramCoreEngine {
             .insert(account_id, asset_token);
         self.save_state()?;
 
+        let is_offline = self.state.read().offline_mode;
         if let Some(ref target_slot) = switch_to_new_slot {
             let client = self.rebuild_client_for_slot(target_slot)?;
             client.set_auth_session(auth.clone());
+            if !is_offline {
+                client.connect_ws();
+            }
         } else if let Ok(client) = self.client() {
             client.set_auth_session(auth.clone());
+            if !is_offline {
+                client.connect_ws();
+            }
         }
 
         Ok(slot_record)
@@ -1125,22 +1217,8 @@ impl TelegramCoreEngine {
     ) -> CoreResult<Value> {
         let payload = parse_payload(payload_json)?;
 
-        if self.state.read().locked {
-            let allowed_when_locked = matches!(
-                (domain, action),
-                ("sessions", "unlockApp")
-                    | ("sessions", "verify_passcode")
-                    | ("sessions", "passcode_status")
-                    | ("sessions", "listAccounts")
-                    | ("sessions", "list_accounts")
-                    | ("sessions", "checkGenerationFence")
-                    | ("auth", "status")
-                    | ("auth", "checkHealth")
-                    | ("auth", "getServerStatus")
-            );
-            if !allowed_when_locked {
-                return Err(CoreDispatchError::passcode_locked());
-            }
+        if self.state.read().locked && !Self::is_allowed_when_locked(domain, action) {
+            return Err(CoreDispatchError::passcode_locked());
         }
 
         let client = self.client()?;
@@ -1164,24 +1242,23 @@ impl TelegramCoreEngine {
         payload_json: &str,
     ) -> CoreResult<Value> {
         let payload = parse_payload(payload_json)?;
-        if self.state.read().locked {
-            let allowed_when_locked = matches!(
-                (domain, action),
-                ("sessions", "unlockApp")
-                    | ("sessions", "verify_passcode")
-                    | ("sessions", "passcode_status")
-                    | ("sessions", "listAccounts")
-                    | ("sessions", "list_accounts")
-                    | ("sessions", "checkGenerationFence")
-                    | ("auth", "status")
-                    | ("auth", "checkHealth")
-                    | ("auth", "getServerStatus")
-            );
-            if !allowed_when_locked {
-                return Err(CoreDispatchError::passcode_locked());
-            }
+        if self.state.read().locked && !Self::is_allowed_when_locked(domain, action) {
+            return Err(CoreDispatchError::passcode_locked());
         }
         domains::dispatch_async(self, domain, action, &payload).await
+    }
+
+    fn is_allowed_when_locked(domain: &str, action: &str) -> bool {
+        let (norm_domain, norm_action) = domains::normalize_domain_and_action(domain, action);
+        matches!(
+            (norm_domain.as_str(), norm_action.as_str()),
+            ("sessions", "unlockApp")
+                | ("sessions", "passcodeStatus")
+                | ("sessions", "listAccounts")
+                | ("sessions", "checkGenerationFence")
+                | ("sessions", "verifyAssetToken")
+                | ("auth", "checkHealth")
+        )
     }
 
     pub fn invoke_envelope(&self, domain: &str, action: &str, payload_json: &str) -> CoreEnvelopeDto {

@@ -896,6 +896,9 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/v1/stories/{story_id}", delete(routes::social::stories_delete))
         .route("/api/v1/calls", get(routes::social::calls_list))
         .route("/api/v1/calls/invite", post(routes::social::calls_invite))
+        .route("/api/v1/calls/accept", post(routes::social::calls_accept))
+        .route("/api/v1/calls/decline", post(routes::social::calls_decline))
+        .route("/api/v1/calls/hangup", post(routes::social::calls_hangup))
         .route("/api/v1/calls/signal", post(routes::social::calls_signal))
         .route("/api/v1/calls/{call_id}/rate", post(routes::social::calls_rate))
         .route("/api/v1/search", get(routes::analytics_wallet::search_unified))
@@ -975,6 +978,7 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route("/api/v1/mcp/permission/approve", post(mcp_permission_approve))
         .route("/api/v1/computer/lease", post(routes::acp::computer_lease_acquire))
         .route("/api/v1/computer/lease/acquire", post(routes::acp::computer_lease_acquire))
+        .route("/api/v1/computer/lease/release", post(routes::acp::computer_lease_release))
         .route("/api/v1/computer/lease/emergency_takeover", post(routes::acp::computer_lease_emergency_takeover))
         .route("/api/v1/computer/action", post(computer_action_execute))
         .route("/api/v1/talk/session", post(routes::acp::talk_session_create))
@@ -1104,6 +1108,10 @@ pub fn build_router_with_state(state: Arc<AppState>) -> Router {
         .route(
             "/api/v1/bots/{bot_id}/block",
             post(routes::bots_miniapps::bots_block),
+        )
+        .route(
+            "/api/v1/bots/{bot_id}/regenerate-token",
+            post(routes::bots_miniapps::bots_regenerate_token),
         )
         .route(
             "/api/v1/fabushi-bots",
@@ -5427,7 +5435,13 @@ async fn mcp_permission_approve(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<Value>,
 ) -> Response {
-    let req_id = match payload.get("request_id").and_then(|v| v.as_str()) {
+    let req_id = match payload
+        .get("request_id")
+        .or_else(|| payload.get("requestId"))
+        .or_else(|| payload.get("approval_id"))
+        .or_else(|| payload.get("approvalId"))
+        .and_then(|v| v.as_str())
+    {
         Some(id) => id,
         None => {
             return (
@@ -5441,7 +5455,11 @@ async fn mcp_permission_approve(
         }
     };
 
-    let allow = payload.get("allow").and_then(|v| v.as_bool()).unwrap_or(true);
+    let allow = payload
+        .get("allow")
+        .or_else(|| payload.get("approved"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let resolved = state.permission_dock.write().resolve(req_id, allow);
 
     match resolved {

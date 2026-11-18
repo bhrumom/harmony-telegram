@@ -63,6 +63,7 @@ napi-derive-ohos = "1.2"
 
 [dev-dependencies]
 gpui_telegram_server.workspace = true
+axum.workspace = true
 
 [build-dependencies]
 napi-build-ohos = "1.2"

@@ -35,30 +35,48 @@ fn build_send_request(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
+    let file_id_opt = opt_str(payload, &["fileId", "file_id", "mediaId"]);
+    let card_kind_opt = opt_str(payload, &["cardType", "mediaType", "messageType"])
+        .or_else(|| file_id_opt.as_ref().map(|_| "document".to_string()));
+
     let content: Option<MessageContent> = if let Some(c_val) = payload.get("content") {
         if c_val.is_null() {
             None
         } else {
             Some(serde_json::from_value(c_val.clone())?)
         }
-    } else if let Some(ref card_type) = opt_str(payload, &["cardType", "mediaType", "messageType"]) {
-        let caption_txt = text.clone().unwrap_or_default();
-        let file_id = opt_str(payload, &["fileId", "file_id", "mediaId"]).unwrap_or_default();
-        let synthesized = match card_type.as_str() {
-            "photo" => json!({ "type": "Photo", "file_id": file_id, "caption": caption_txt, "width": 1280, "height": 720 }),
-            "video" => json!({ "type": "Video", "file_id": file_id, "caption": caption_txt, "width": 1280, "height": 720, "duration_secs": 15 }),
-            "voice" => json!({ "type": "Voice", "file_id": file_id, "duration_secs": opt_u32(payload, &["durationSecs"]).unwrap_or(5), "waveform": [] }),
-            "document" | "file" => json!({
-                "type": "Document",
-                "file_id": file_id,
-                "file_name": opt_str(payload, &["fileName", "filename"]).unwrap_or_else(|| "attachment.bin".into()),
-                "mime_type": opt_str(payload, &["mimeType", "mime_type"]).unwrap_or_else(|| "application/octet-stream".into()),
-                "size_bytes": opt_u64(payload, &["sizeBytes", "size_bytes"]).unwrap_or(0),
-                "caption": caption_txt
+    } else if let Some(ref card_type) = card_kind_opt {
+        let file_id = file_id_opt.unwrap_or_default();
+        match card_type.to_ascii_lowercase().as_str() {
+            "photo" | "image" => Some(MessageContent::Photo {
+                file_id,
+                caption: text.clone(),
+                width: opt_u32(payload, &["width"]).unwrap_or(1280),
+                height: opt_u32(payload, &["height"]).unwrap_or(720),
             }),
-            _ => Value::Null,
-        };
-        serde_json::from_value(synthesized).ok()
+            "video" => Some(MessageContent::Video {
+                file_id,
+                duration: opt_u32(payload, &["durationSecs", "duration"]).unwrap_or(15),
+                width: opt_u32(payload, &["width"]).unwrap_or(1280),
+                height: opt_u32(payload, &["height"]).unwrap_or(720),
+                caption: text.clone(),
+            }),
+            "voice" | "audio" => Some(MessageContent::Audio {
+                file_id,
+                duration: opt_u32(payload, &["durationSecs", "duration"]).unwrap_or(5),
+                title: opt_str(payload, &["title"]),
+                performer: opt_str(payload, &["performer"]),
+            }),
+            "document" | "file" => Some(MessageContent::Document {
+                file_id,
+                file_name: opt_str(payload, &["fileName", "filename"]).unwrap_or_else(|| "attachment.bin".into()),
+                mime_type: opt_str(payload, &["mimeType", "mime_type"]).unwrap_or_else(|| "application/octet-stream".into()),
+                size_bytes: opt_u64(payload, &["sizeBytes", "size_bytes"]).unwrap_or(0),
+            }),
+            _ => text
+                .as_ref()
+                .map(|t| MessageContent::text_with_entities(t.clone(), entities.clone())),
+        }
     } else {
         text.as_ref()
             .map(|t| MessageContent::text_with_entities(t.clone(), entities.clone()))
@@ -285,6 +303,18 @@ pub async fn handle_messages(
             let poll_id = req_u64(payload, &["pollId", "poll_id"], "pollId")?;
             to_json_val(client.close_poll(poll_id).await?)
         }
+        "getPoll" => {
+            let poll_id = req_u64(payload, &["pollId", "poll_id"], "pollId")?;
+            let token = client
+                .token()
+                .ok_or_else(|| CoreDispatchError::unauthorized("No active session token"))?;
+            let path = format!("/api/v1/polls/{poll_id}");
+            client
+                .http_client
+                .request_json(reqwest::Method::GET, &path, Some(&token), None::<&()>)
+                .await
+                .map_err(Into::into)
+        }
         "markRead" => {
             let chat_id = req_i64(payload, &["chatId", "chat_id"], "chatId")?;
             let max_id = opt_i64(payload, &["maxId", "max_id", "messageId"]).unwrap_or(i64::MAX / 2);
@@ -382,8 +412,18 @@ pub async fn handle_messages(
                     "Instant View URL must start with http:// or https://",
                 ));
             }
-            let raw_article = opt_str(payload, &["markdown", "html", "content"])
-                .unwrap_or_else(|| format!("# Instant View\n\nSource: {url}\n\n Native reader article view."));
+            let raw_article = if let Some(local_body) = opt_str(payload, &["markdown", "html", "content", "rawHtml"]) {
+                local_body
+            } else {
+                let http = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(6))
+                    .build()
+                    .map_err(|e| CoreDispatchError::internal(format!("Instant View HTTP client error: {e}")))?;
+                match http.get(&url).send().await {
+                    Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
+                    _ => format!("# Instant View\n\nSource: {url}\n\nNative reader article view."),
+                }
+            };
             let mut blocks = Vec::new();
             let mut title = "Instant View Article".to_string();
             for line in raw_article.lines() {
@@ -537,6 +577,7 @@ pub async fn handle_sync(
             let diff = client.http_client.sync_get_difference(&token, &req).await?;
             let _ = client.process_ws_frame(WsServerFrame::SyncDiff(diff.clone()));
             client.sync_coordinator.set_pts(ChatId(chat_id), diff.current_pts);
+            client.clear_gap_chat(ChatId(chat_id));
             engine.with_state_mut(|st| {
                 st.pts_by_chat.insert(chat_id, diff.current_pts);
             })?;

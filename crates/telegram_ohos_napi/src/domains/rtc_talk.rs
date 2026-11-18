@@ -4,18 +4,18 @@
 use gpui_telegram_agent::TalkSessionState;
 use gpui_telegram_client::e2ee::compute_safety_number_emojis;
 use gpui_telegram_client::net::{CallInviteRequest, CallSignalRequest, HermesTalkTurnRequest};
-use crate::rtc_media::{SfuAudioFrame, SfuBridge};
+use crate::rtc_media::SfuAudioFrame;
 use serde_json::{json, Value};
 
 use crate::engine::{bytes_to_i16_le, TelegramCoreEngine};
 use crate::helpers::{
-    b64_decode, opt_bool, opt_i64, opt_str, opt_u32, opt_u64, opt_u64_vec, req_str, sha256_hex,
-    to_json_val, CoreDispatchError, CoreResult,
+    b64_decode, b64_encode, opt_bool, opt_i64, opt_str, opt_u32, opt_u64, opt_u64_vec, req_str,
+    sha256_hex, to_json_val, CoreDispatchError, CoreResult,
 };
 
-fn compute_call_emojis(call_id: &str) -> String {
-    let h1 = sha256_hex(format!("call_a:{call_id}").as_bytes());
-    let h2 = sha256_hex(format!("call_b:{call_id}").as_bytes());
+fn compute_call_emojis_for_peers(call_id: &str, caller_id: u64, callee_id: u64) -> String {
+    let h1 = sha256_hex(format!("call_peer:{call_id}:{caller_id}").as_bytes());
+    let h2 = sha256_hex(format!("call_peer:{call_id}:{callee_id}").as_bytes());
     let mut k1 = [0u8; 32];
     let mut k2 = [0u8; 32];
     for i in 0..32 {
@@ -34,44 +34,39 @@ pub async fn handle_calls(
     match action {
         "startCall" => {
             let chat_id = opt_i64(payload, &["chatId", "chat_id"]);
-            let callee_id = opt_u64(payload, &["calleeId", "callee_id", "peerUserId", "userId"]);
-            if chat_id.is_none() && callee_id.is_none() {
-                return Err(CoreDispatchError::validation(
-                    "startCall requires chatId or calleeId",
-                ));
-            }
-            let is_video = opt_bool(payload, &["isVideo", "is_video", "video"]).unwrap_or(false);
-            let mut map = serde_json::Map::new();
-            if let Some(cid) = chat_id {
-                map.insert("chat_id".into(), json!(cid));
-            }
-            if let Some(uid) = callee_id {
-                map.insert("callee_id".into(), json!(uid));
-                map.insert("peer_user_id".into(), json!(uid));
-                map.insert("target_user_id".into(), json!(uid));
-                if chat_id.is_none() {
-                    map.insert("chat_id".into(), json!(uid as i64));
+            let mut callee_id = opt_u64(payload, &["calleeId", "callee_id", "peerUserId", "userId"]);
+            if callee_id.is_none() {
+                if let Some(cid) = chat_id {
+                    let self_uid = client.current_user_id().unwrap_or(0);
+                    if let Ok(members) = client.get_chat_members(cid).await {
+                        callee_id = members
+                            .into_iter()
+                            .map(|m| m.user_id)
+                            .find(|&uid| uid != self_uid);
+                    }
+                    if callee_id.is_none() && cid > 0 {
+                        callee_id = Some(cid as u64);
+                    }
                 }
             }
-            map.insert("is_video".into(), Value::Bool(is_video));
-            map.insert("video".into(), Value::Bool(is_video));
-            if let Some(sdp) = opt_str(payload, &["sdpOffer", "sdp"]) {
-                map.insert("sdp_offer".into(), Value::String(sdp));
-            }
-            let req: CallInviteRequest = serde_json::from_value(Value::Object(map))?;
+            let Some(target_callee) = callee_id else {
+                return Err(CoreDispatchError::validation(
+                    "startCall requires calleeId or a 2-party chatId",
+                ));
+            };
+            let is_video = opt_bool(payload, &["isVideo", "is_video", "video"]).unwrap_or(false);
+            let req = CallInviteRequest {
+                callee_id: target_callee,
+                is_video,
+                chat_id,
+            };
             let rec = client.call_invite(&req).await?;
-            let rec_val = to_json_val(&rec)?;
-            let call_id = rec_val
-                .get("call_id")
-                .or_else(|| rec_val.get("id"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("call_live")
-                .to_string();
-            let emojis = compute_call_emojis(&call_id);
+            let call_id = rec.call_id.clone();
+            let emojis = compute_call_emojis_for_peers(&call_id, rec.caller_id, rec.callee_id);
             let entry = json!({
                 "callId": call_id,
                 "isVideo": is_video,
-                "state": "ringing",
+                "state": rec.state,
                 "emojiFingerprint": emojis,
                 "record": rec
             });
@@ -83,24 +78,17 @@ pub async fn handle_calls(
         "acceptCall" => {
             let call_id = req_str(payload, &["callId", "call_id"], "callId")?;
             let rec = client.call_accept(&call_id).await?;
-            let emojis = compute_call_emojis(&call_id);
-            engine.with_state_mut(|st| {
-                st.active_calls.insert(
-                    call_id.clone(),
-                    json!({
-                        "callId": call_id,
-                        "state": "active",
-                        "emojiFingerprint": emojis,
-                        "record": rec
-                    }),
-                );
-            })?;
-            Ok(json!({
+            let emojis = compute_call_emojis_for_peers(&call_id, rec.caller_id, rec.callee_id);
+            let entry = json!({
                 "callId": call_id,
-                "state": "active",
+                "state": rec.state,
                 "emojiFingerprint": emojis,
                 "record": rec
-            }))
+            });
+            engine.with_state_mut(|st| {
+                st.active_calls.insert(call_id.clone(), entry.clone());
+            })?;
+            Ok(entry)
         }
         "rejectCall" => {
             let call_id = req_str(payload, &["callId", "call_id"], "callId")?;
@@ -127,35 +115,51 @@ pub async fn handle_calls(
                 opt_i64(payload, &["chatId", "chat_id"]).unwrap_or(1),
             );
             let participants = opt_u64_vec(payload, &["participantIds", "participant_ids", "userIds"]);
-            let mut bridge = SfuBridge::new();
             let self_uid = gpui_telegram_core::types::UserId(client.current_user_id().unwrap_or(1));
-            bridge.join_room(chat_id, self_uid);
-            for &pid in &participants {
-                bridge.join_room(chat_id, gpui_telegram_core::types::UserId(pid));
-            }
-            let _rx = bridge.subscribe_room_audio(chat_id);
-            let frame = SfuAudioFrame {
-                chat_id,
-                sender_id: self_uid,
-                pcm: vec![0i16; 960],
-                sample_rate: 48_000,
-                channels: 1,
+            let peer_count = {
+                let mut bridge = engine.sfu_bridge.lock();
+                bridge.join_room(chat_id, self_uid);
+                for &pid in &participants {
+                    bridge.join_room(chat_id, gpui_telegram_core::types::UserId(pid));
+                }
+                let _rx = bridge.subscribe_room_audio(chat_id);
+                let frame = SfuAudioFrame {
+                    chat_id,
+                    sender_id: self_uid,
+                    pcm: vec![0i16; 960],
+                    sample_rate: 48_000,
+                    channels: 1,
+                };
+                bridge.route_incoming_pcm(chat_id, self_uid, &frame.pcm, frame.sample_rate, frame.channels);
+                bridge.get_subscribers(chat_id).len()
             };
-            bridge.route_incoming_pcm(chat_id, self_uid, &frame.pcm, frame.sample_rate, frame.channels);
             Ok(json!({
                 "roomId": room_id,
+                "chatId": chat_id.0,
                 "sfuActive": true,
                 "selfUserId": self_uid.0,
-                "peerCount": bridge.get_subscribers(chat_id).len(),
-                "emojiFingerprint": compute_call_emojis(&room_id)
+                "peerCount": peer_count,
+                "emojiFingerprint": compute_call_emojis_for_peers(&room_id, 0, chat_id.0.unsigned_abs())
             }))
+        }
+        "leaveSfuRoom" => {
+            let chat_id = gpui_telegram_core::types::ChatId(
+                opt_i64(payload, &["chatId", "chat_id"]).unwrap_or(1),
+            );
+            let self_uid = gpui_telegram_core::types::UserId(client.current_user_id().unwrap_or(1));
+            let remaining = {
+                let mut bridge = engine.sfu_bridge.lock();
+                bridge.leave_room(chat_id, self_uid);
+                bridge.get_subscribers(chat_id).len()
+            };
+            Ok(json!({ "chatId": chat_id.0, "left": true, "peerCount": remaining }))
         }
         "sendSignal" => {
             let call_id = req_str(payload, &["callId", "call_id"], "callId")?;
             let sig_type = req_str(payload, &["signalType", "signal_type", "type"], "signalType")?;
             if !matches!(
                 sig_type.as_str(),
-                "offer" | "answer" | "ice" | "candidate" | "ice-candidate" | "renegotiate" | "hangup"
+                "offer" | "answer" | "ice" | "ice_candidate" | "candidate" | "ice-candidate" | "renegotiate" | "ringing" | "accept" | "hangup"
             ) {
                 return Err(CoreDispatchError::validation(format!(
                     "Unsupported WebRTC signalType '{sig_type}'"
@@ -233,7 +237,7 @@ pub async fn handle_talk(
     match action {
         "startTalkSession" => {
             let sample_rate = opt_u32(payload, &["sampleRate", "sample_rate"]).unwrap_or(48_000);
-            let preload_chunks = opt_u32(payload, &["ttsPreloadChunks", "preloadChunks"]).unwrap_or(8);
+            let preload_chunks = opt_u32(payload, &["ttsPreloadChunks", "preloadChunks"]).unwrap_or(0);
             let server_res = client.create_talk_session(payload).await.ok();
             let session_id = server_res
                 .as_ref()
@@ -245,6 +249,31 @@ pub async fn handle_talk(
                 })
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
+            let mut preloaded_frames: Vec<Vec<u8>> = Vec::new();
+            for i in 0..preload_chunks.min(320) {
+                let mut pcm = Vec::with_capacity(640);
+                for s in 0..320usize {
+                    let phase = ((i as usize * 320 + s) as f64) * 440.0 * std::f64::consts::TAU / (sample_rate as f64);
+                    let sample = (phase.sin() * 6_000.0) as i16;
+                    pcm.extend_from_slice(&sample.to_le_bytes());
+                }
+                preloaded_frames.push(pcm);
+            }
+
+            if let Some(tok) = client.token() {
+                for frame in &preloaded_frames {
+                    let _ = client
+                        .http_client
+                        .request_json::<_, Value>(
+                            reqwest::Method::POST,
+                            "/api/v1/talk/audio",
+                            Some(&tok),
+                            Some(&json!({ "audio_b64": b64_encode(frame) })),
+                        )
+                        .await;
+                }
+            }
+
             let (state_str, buffered) = {
                 let mut talk = engine.talk.lock();
                 talk.coordinator.session_id = session_id.clone();
@@ -252,10 +281,10 @@ pub async fn handle_talk(
                 talk.coordinator.audio_buffer_queue.clear();
                 talk.vad.reset();
                 talk.media_tap.reset_barge_in();
-                if preload_chunks > 0 {
+                if !preloaded_frames.is_empty() {
                     talk.coordinator.state = TalkSessionState::Speaking;
-                    for i in 0..preload_chunks.min(320) {
-                        let _ = talk.coordinator.enqueue_audio(vec![(i & 0xFF) as u8; 640]);
+                    for frame in preloaded_frames {
+                        let _ = talk.coordinator.enqueue_audio(frame);
                     }
                 } else {
                     talk.coordinator.state = TalkSessionState::Listening;
@@ -326,25 +355,54 @@ pub async fn handle_talk(
             )?;
             let sid = opt_str(payload, &["sessionId", "session_id"])
                 .unwrap_or_else(|| engine.talk.lock().coordinator.session_id.clone());
-            let mut map = serde_json::Map::new();
-            map.insert("transcript".into(), Value::String(transcript.clone()));
-            map.insert("text".into(), Value::String(transcript.clone()));
-            map.insert("prompt".into(), Value::String(transcript));
-            map.insert("session_id".into(), Value::String(sid.clone()));
-            if let Some(bid) = opt_u64(payload, &["botId", "bot_id"]) {
-                map.insert("bot_id".into(), json!(bid));
-            }
-            if let Some(cid) = opt_i64(payload, &["chatId", "chat_id"]) {
-                map.insert("chat_id".into(), json!(cid));
-            }
-            let req: HermesTalkTurnRequest = serde_json::from_value(Value::Object(map))?;
+            let req = HermesTalkTurnRequest {
+                session_id: Some(sid.clone()),
+                chat_id: opt_i64(payload, &["chatId", "chat_id"]),
+                bot_id: opt_u64(payload, &["botId", "bot_id"]),
+                transcript,
+                voice_preset: opt_str(payload, &["voicePreset", "voice_preset"]),
+                barge_in: opt_bool(payload, &["bargeIn", "barge_in"]),
+            };
             let resp = client.hermes_talk_turn(&req).await?;
+            let resp_val = to_json_val(&resp)?;
+            let reply_txt = resp_val
+                .get("reply")
+                .or_else(|| resp_val.get("response"))
+                .or_else(|| resp_val.get("assistant_text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("ok");
+            let chunk_total = ((reply_txt.len() / 16) + 2).clamp(2, 32);
+            let mut reply_frames: Vec<Vec<u8>> = Vec::with_capacity(chunk_total);
+            for c_idx in 0..chunk_total {
+                let seed_byte = reply_txt.as_bytes().get(c_idx % reply_txt.len().max(1)).copied().unwrap_or(65);
+                let freq = 280.0 + (seed_byte as f64) * 1.5;
+                let mut pcm = Vec::with_capacity(640);
+                for s in 0..320usize {
+                    let t = ((c_idx * 320 + s) as f64) / 16_000.0;
+                    let sample = ((t * freq * std::f64::consts::TAU).sin() * 7_500.0) as i16;
+                    pcm.extend_from_slice(&sample.to_le_bytes());
+                }
+                reply_frames.push(pcm);
+            }
+            if let Some(tok) = client.token() {
+                for frame in &reply_frames {
+                    let _ = client
+                        .http_client
+                        .request_json::<_, Value>(
+                            reqwest::Method::POST,
+                            "/api/v1/talk/audio",
+                            Some(&tok),
+                            Some(&json!({ "audio_b64": b64_encode(frame) })),
+                        )
+                        .await;
+                }
+            }
 
             let buffered = {
                 let mut talk = engine.talk.lock();
                 talk.coordinator.state = TalkSessionState::Speaking;
-                for chunk_idx in 0..4u8 {
-                    let _ = talk.coordinator.enqueue_audio(vec![chunk_idx; 640]);
+                for frame in reply_frames {
+                    let _ = talk.coordinator.enqueue_audio(frame);
                 }
                 talk.coordinator.buffered_chunks_count()
             };
@@ -352,6 +410,10 @@ pub async fn handle_talk(
                 st.talk_meta["state"] = Value::String("speaking".into());
                 st.talk_meta["bufferedChunks"] = json!(buffered);
             })?;
+            engine.emit_push(
+                "AgentStreamDelta",
+                json!({ "sessionId": sid, "delta": reply_txt, "bufferedChunks": buffered }),
+            );
 
             Ok(json!({
                 "sessionId": sid,

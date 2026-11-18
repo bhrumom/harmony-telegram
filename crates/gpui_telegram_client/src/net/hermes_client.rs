@@ -364,6 +364,8 @@ pub struct HermesToolsetDto {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HermesUpdateToolsetsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_toolsets: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolset: Option<String>,
@@ -503,6 +505,7 @@ pub struct HermesKanbanBoardDto {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HermesCreateKanbanBoardRequest {
+    #[serde(alias = "title")]
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub columns: Option<Vec<String>>,

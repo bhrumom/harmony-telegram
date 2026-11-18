@@ -44,7 +44,6 @@ pub async fn handle_dialogs(
                 }),
             );
             map.insert("member_ids".into(), to_json_val(&members)?);
-            map.insert("user_ids".into(), to_json_val(&members)?);
             map.insert("is_forum".into(), Value::Bool(is_forum));
             if let Some(ab) = about {
                 map.insert("about".into(), Value::String(ab));
@@ -139,38 +138,28 @@ pub async fn handle_dialogs(
 
 fn build_folder_dto(payload: &Value, id_override: Option<i64>) -> CoreResult<ChatFolderDto> {
     let title = req_str(payload, &["title", "name"], "title")?;
-    let included = opt_i64_vec(payload, &["includedChatIds", "included_chat_ids", "pinnedChatIds"]);
-    let excluded = opt_i64_vec(payload, &["excludedChatIds", "excluded_chat_ids"]);
-    let icon = opt_str(payload, &["icon", "emoticon"]).unwrap_or_else(|| "📁".into());
-    let mut map = serde_json::Map::new();
-    if let Some(fid) = id_override.or_else(|| opt_i64(payload, &["folderId", "folder_id", "id"])) {
-        map.insert("id".into(), json!(fid));
-        map.insert("folder_id".into(), json!(fid));
-    }
-    map.insert("title".into(), Value::String(title));
-    map.insert("icon".into(), Value::String(icon.clone()));
-    map.insert("emoticon".into(), Value::String(icon));
-    map.insert("included_chat_ids".into(), to_json_val(&included)?);
-    map.insert("include_peer_ids".into(), to_json_val(&included)?);
-    map.insert("excluded_chat_ids".into(), to_json_val(&excluded)?);
-    map.insert("exclude_peer_ids".into(), to_json_val(&excluded)?);
-    map.insert(
-        "include_contacts".into(),
-        Value::Bool(opt_bool(payload, &["includeContacts", "include_contacts"]).unwrap_or(false)),
-    );
-    map.insert(
-        "include_groups".into(),
-        Value::Bool(opt_bool(payload, &["includeGroups", "include_groups"]).unwrap_or(true)),
-    );
-    map.insert(
-        "include_channels".into(),
-        Value::Bool(opt_bool(payload, &["includeChannels", "include_channels"]).unwrap_or(true)),
-    );
-    map.insert(
-        "include_bots".into(),
-        Value::Bool(opt_bool(payload, &["includeBots", "include_bots"]).unwrap_or(false)),
-    );
-    serde_json::from_value(Value::Object(map)).map_err(Into::into)
+    let included = opt_i64_vec(payload, &["includedChatIds", "included_chat_ids", "includeChats", "include_chats"]);
+    let excluded = opt_i64_vec(payload, &["excludedChatIds", "excluded_chat_ids", "excludeChats", "exclude_chats"]);
+    let pinned = opt_i64_vec(payload, &["pinnedChatIds", "pinned_chat_ids", "pinnedChats", "pinned_chats"]);
+    Ok(ChatFolderDto {
+        id: id_override
+            .or_else(|| opt_i64(payload, &["folderId", "folder_id", "id"]))
+            .unwrap_or(0),
+        title,
+        emoticon: opt_str(payload, &["icon", "emoticon"]).or_else(|| Some("📁".into())),
+        include_chats: included,
+        exclude_chats: excluded,
+        pinned_chats: pinned,
+        include_contacts: opt_bool(payload, &["includeContacts", "include_contacts"]).unwrap_or(false),
+        include_non_contacts: opt_bool(payload, &["includeNonContacts", "include_non_contacts"]).unwrap_or(false),
+        include_groups: opt_bool(payload, &["includeGroups", "include_groups"]).unwrap_or(true),
+        include_channels: opt_bool(payload, &["includeChannels", "include_channels"]).unwrap_or(true),
+        include_bots: opt_bool(payload, &["includeBots", "include_bots"]).unwrap_or(false),
+        exclude_muted: opt_bool(payload, &["excludeMuted", "exclude_muted"]).unwrap_or(false),
+        exclude_read: opt_bool(payload, &["excludeRead", "exclude_read"]).unwrap_or(false),
+        exclude_archived: opt_bool(payload, &["excludeArchived", "exclude_archived"]).unwrap_or(false),
+        sort_order: opt_i64(payload, &["sortOrder", "sort_order"]).unwrap_or(0) as i32,
+    })
 }
 
 pub async fn handle_folders(

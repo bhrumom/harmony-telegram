@@ -44,12 +44,20 @@ pub async fn handle_hermes(
         "getStatus" => to_json_val(client.hermes_status_for_bot(bot_id).await?),
         "startTurn" => {
             let prompt = req_str(payload, &["prompt", "message", "text"], "prompt")?;
-            let mut map = payload.as_object().cloned().unwrap_or_default();
-            map.insert("prompt".into(), Value::String(prompt.clone()));
-            map.entry("message".to_string())
-                .or_insert_with(|| Value::String(prompt));
-            let req: HermesTurnRequest = serde_json::from_value(Value::Object(map))?;
-            to_json_val(client.hermes_run_turn(&req).await?)
+            let req = HermesTurnRequest {
+                prompt,
+                session_id: opt_str(payload, &["sessionId", "session_id"]),
+                chat_id: opt_i64(payload, &["chatId", "chat_id"]),
+                bot_id,
+                model: opt_str(payload, &["model"]),
+                provider: opt_str(payload, &["provider"]),
+                system_prompt: opt_str(payload, &["systemPrompt", "system_prompt"]),
+                yolo_mode: opt_bool(payload, &["yoloMode", "yolo_mode"]),
+            };
+            let turn = client.hermes_run_turn(&req).await?;
+            let val = to_json_val(&turn)?;
+            engine.emit_push("AgentStreamDelta", val.clone());
+            Ok(val)
         }
         "streamTurnEvents" => {
             let token = client
@@ -78,9 +86,17 @@ pub async fn handle_hermes(
         }
         "runSlashCommand" => {
             let cmd = req_str(payload, &["command", "input"], "command")?;
-            let mut map = payload.as_object().cloned().unwrap_or_default();
-            map.insert("command".into(), Value::String(cmd.clone()));
-            map.insert("input".into(), Value::String(cmd));
+            let mut map = serde_json::Map::new();
+            map.insert("command".into(), Value::String(cmd));
+            if let Some(sid) = opt_str(payload, &["sessionId", "session_id"]) {
+                map.insert("session_id".into(), Value::String(sid));
+            }
+            if let Some(cid) = opt_i64(payload, &["chatId", "chat_id"]) {
+                map.insert("chat_id".into(), json!(cid));
+            }
+            if let Some(bid) = bot_id {
+                map.insert("bot_id".into(), json!(bid));
+            }
             let req: HermesCommandRequest = serde_json::from_value(Value::Object(map))?;
             to_json_val(client.hermes_run_command(&req).await?)
         }
@@ -164,11 +180,15 @@ pub async fn handle_hermes(
         "proposeSkill" => {
             let name = req_str(payload, &["name", "skillName"], "name")?;
             let content = req_str(payload, &["content", "markdown", "body"], "content")?;
-            let mut map = payload.as_object().cloned().unwrap_or_default();
-            map.insert("name".into(), Value::String(name));
-            map.insert("content".into(), Value::String(content.clone()));
-            map.insert("markdown".into(), Value::String(content));
-            let req: HermesSaveSkillRequest = serde_json::from_value(Value::Object(map))?;
+            let tags = opt_string_vec(payload, &["tags"]);
+            let req = HermesSaveSkillRequest {
+                name,
+                description: opt_str(payload, &["description"]),
+                category: opt_str(payload, &["category"]),
+                content,
+                enabled: opt_bool(payload, &["enabled"]),
+                tags: if tags.is_empty() { None } else { Some(tags) },
+            };
             to_json_val(client.hermes_save_skill_for_bot(bot_id, &req).await?)
         }
         "approveSkill" => {
@@ -197,17 +217,13 @@ pub async fn handle_hermes(
             Ok(json!({ "toolsets": toolsets, "count": toolsets.len() }))
         }
         "setToolsetPreset" => {
-            let mut map = payload.as_object().cloned().unwrap_or_default();
-            if let Some(p) = opt_str(payload, &["preset"]) {
-                map.insert("preset".into(), Value::String(p));
-            }
-            if !map.contains_key("enabled_toolsets") {
-                let enabled = opt_string_vec(payload, &["enabledToolsets", "toolsets"]);
-                if !enabled.is_empty() {
-                    map.insert("enabled_toolsets".into(), to_json_val(enabled)?);
-                }
-            }
-            let req: HermesUpdateToolsetsRequest = serde_json::from_value(Value::Object(map))?;
+            let enabled = opt_string_vec(payload, &["enabledToolsets", "enabled_toolsets", "toolsets"]);
+            let req = HermesUpdateToolsetsRequest {
+                preset: opt_str(payload, &["preset"]),
+                enabled_toolsets: if enabled.is_empty() { None } else { Some(enabled) },
+                toolset: opt_str(payload, &["toolset"]),
+                enabled: opt_bool(payload, &["enabled"]),
+            };
             let updated = client.hermes_update_toolsets_for_bot(bot_id, &req).await?;
             Ok(json!({ "toolsets": updated, "count": updated.len() }))
         }
@@ -279,8 +295,17 @@ pub async fn handle_tasks(
             }))
         }
         "listTasks" => {
-            let server_tasks = client.list_tasks().await?;
+            let mut server_tasks = client.list_tasks().await?;
             let fsms = engine.persisted_snapshot().task_fsms;
+            for item in &mut server_tasks {
+                if let Some(tid) = item.get("task_id").or_else(|| item.get("id")).and_then(|v| v.as_str()) {
+                    if let Some(raw_fsm) = fsms.get(tid) {
+                        if let Ok(fsm) = serde_json::from_str::<TaskFsm>(raw_fsm) {
+                            item["state"] = Value::String(fsm.state.as_str().to_string());
+                        }
+                    }
+                }
+            }
             Ok(json!({
                 "tasks": server_tasks,
                 "localFsms": fsms,
@@ -290,71 +315,75 @@ pub async fn handle_tasks(
         "listKanban" => {
             let mut boards = client.hermes_kanban_boards().await?;
             if boards.is_empty() && opt_bool(payload, &["ensureDefaultBoard"]).unwrap_or(false) {
-                let req: HermesCreateKanbanBoardRequest =
-                    serde_json::from_value(json!({ "title": "Default Board", "name": "Default Board" }))?;
+                let req = HermesCreateKanbanBoardRequest {
+                    name: "Default Board".into(),
+                    columns: None,
+                };
                 boards.push(client.hermes_kanban_create_board(&req).await?);
             }
             Ok(json!({ "boards": boards, "count": boards.len() }))
         }
         "createKanbanBoard" => {
             let title = req_str(payload, &["title", "name"], "title")?;
-            let req: HermesCreateKanbanBoardRequest =
-                serde_json::from_value(json!({ "title": title, "name": title }))?;
+            let cols = opt_string_vec(payload, &["columns"]);
+            let req = HermesCreateKanbanBoardRequest {
+                name: title,
+                columns: if cols.is_empty() { None } else { Some(cols) },
+            };
             to_json_val(client.hermes_kanban_create_board(&req).await?)
         }
         "createKanbanCard" => {
-            let req: HermesCreateKanbanCardRequest = serde_json::from_value(payload.clone())?;
+            let board_id = req_str(payload, &["boardId", "board_id"], "boardId")?;
+            let title = req_str(payload, &["title", "name"], "title")?;
+            let req = HermesCreateKanbanCardRequest {
+                board_id,
+                title,
+                description: opt_str(payload, &["description"]),
+                column: opt_str(payload, &["column", "columnId", "column_id", "status"]),
+                priority: opt_str(payload, &["priority"]),
+                assigned_agent: opt_str(payload, &["assignedAgent", "assigned_agent"]),
+            };
             to_json_val(client.hermes_kanban_create_card(&req).await?)
         }
         "moveKanbanCard" => {
             let card_id = if let Some(cid) = opt_str(payload, &["cardId", "card_id", "id"]) {
                 cid
             } else {
-                // Allow creating + moving in one call if cardId not yet created
                 let board_title = opt_str(payload, &["boardTitle"]).unwrap_or_else(|| "Sprint Board".into());
                 let boards = client.hermes_kanban_boards().await?;
                 let board_id = if let Some(b) = boards.first() {
-                    let bv = to_json_val(b)?;
-                    bv.get("id")
-                        .or_else(|| bv.get("board_id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("default")
-                        .to_string()
+                    b.board_id.clone()
                 } else {
-                    let b_req: HermesCreateKanbanBoardRequest =
-                        serde_json::from_value(json!({ "title": board_title, "name": board_title }))?;
-                    let b = client.hermes_kanban_create_board(&b_req).await?;
-                    let bv = to_json_val(b)?;
-                    bv.get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("default")
-                        .to_string()
+                    let b_req = HermesCreateKanbanBoardRequest {
+                        name: board_title,
+                        columns: None,
+                    };
+                    client.hermes_kanban_create_board(&b_req).await?.board_id
                 };
                 let c_title = req_str(payload, &["title"], "cardId")?;
-                let c_req: HermesCreateKanbanCardRequest = serde_json::from_value(json!({
-                    "board_id": board_id,
-                    "title": c_title,
-                    "column": "todo",
-                    "column_id": "todo"
-                }))?;
-                let created = client.hermes_kanban_create_card(&c_req).await?;
-                let cv = to_json_val(&created)?;
-                cv.get("id")
-                    .or_else(|| cv.get("card_id"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| CoreDispatchError::internal("Created card missing id"))?
-                    .to_string()
+                let c_req = HermesCreateKanbanCardRequest {
+                    board_id,
+                    title: c_title,
+                    description: opt_str(payload, &["description"]),
+                    column: Some("todo".into()),
+                    priority: opt_str(payload, &["priority"]),
+                    assigned_agent: opt_str(payload, &["assignedAgent", "assigned_agent"]),
+                };
+                client.hermes_kanban_create_card(&c_req).await?.card_id
             };
             let target_col = req_str(
                 payload,
                 &["targetColumn", "column", "columnId", "column_id", "status"],
                 "targetColumn",
             )?;
-            let mut map = payload.as_object().cloned().unwrap_or_default();
-            map.insert("column".into(), Value::String(target_col.clone()));
-            map.insert("column_id".into(), Value::String(target_col.clone()));
-            map.insert("status".into(), Value::String(target_col));
-            let req: HermesMoveKanbanCardRequest = serde_json::from_value(Value::Object(map))?;
+            let req = HermesMoveKanbanCardRequest {
+                column: Some(target_col),
+                title: opt_str(payload, &["title"]),
+                description: opt_str(payload, &["description"]),
+                priority: opt_str(payload, &["priority"]),
+                assigned_agent: opt_str(payload, &["assignedAgent", "assigned_agent"]),
+                position: opt_i64(payload, &["position"]).map(|p| p as i32),
+            };
             to_json_val(client.hermes_kanban_move_card(&card_id, &req).await?)
         }
         "createCron" => {
@@ -368,14 +397,15 @@ pub async fn handle_tasks(
                 )));
             }
             let prompt = opt_str(payload, &["prompt", "command"]).unwrap_or_else(|| name.clone());
-            let mut map = payload.as_object().cloned().unwrap_or_default();
-            map.insert("name".into(), Value::String(name));
-            map.insert("schedule".into(), Value::String(schedule.clone()));
-            map.insert("cron".into(), Value::String(schedule));
-            map.insert("prompt".into(), Value::String(prompt));
-            map.entry("enabled".to_string())
-                .or_insert(Value::Bool(true));
-            let req: HermesSaveCronRequest = serde_json::from_value(Value::Object(map))?;
+            let req = HermesSaveCronRequest {
+                job_id: opt_str(payload, &["jobId", "job_id"]),
+                name,
+                schedule,
+                prompt,
+                chat_id: opt_i64(payload, &["chatId", "chat_id"]),
+                bot_id: opt_u64(payload, &["botId", "bot_id"]),
+                enabled: Some(opt_bool(payload, &["enabled"]).unwrap_or(true)),
+            };
             to_json_val(client.hermes_save_cron(&req).await?)
         }
         "listCrons" => {
@@ -434,67 +464,83 @@ pub async fn handle_mcp(
         }
         "invokeTool" => {
             let tool_name = req_str(payload, &["toolName", "tool_name", "name"], "toolName")?;
-            let risk = opt_str(payload, &["riskLevel", "risk"]).unwrap_or_else(|| "low".into());
-            if matches!(risk.to_ascii_lowercase().as_str(), "high" | "destructive" | "critical")
-                && !opt_bool(payload, &["approved"]).unwrap_or(false)
-            {
-                let req_id = format!("mcp_gate_{}", uuid::Uuid::new_v4());
-                let gate = json!({
-                    "approvalId": req_id,
-                    "toolName": tool_name,
-                    "riskLevel": risk,
-                    "status": "pending",
-                    "payload": payload
-                });
-                engine.with_state_mut(|st| {
-                    st.mcp_approvals.insert(req_id.clone(), gate.clone());
-                })?;
-                return Ok(json!({
-                    "requiresApproval": true,
-                    "approval": gate
-                }));
+            let risk = opt_str(payload, &["riskLevel", "risk_level", "risk"]);
+            if let Some(ref r) = risk {
+                if matches!(r.to_ascii_lowercase().as_str(), "high" | "destructive" | "critical" | "critical_destructive")
+                    && !opt_bool(payload, &["approved"]).unwrap_or(false)
+                {
+                    // Ensure tool is registered on server with its high/critical risk level so server ToolPermissionDock gates it
+                    let _ = client
+                        .register_mcp_server(&json!({
+                            "server_id": opt_str(payload, &["serverId", "server_id"]).unwrap_or_else(|| "ohos_mcp".into()),
+                            "name": "ohos_mcp",
+                            "tool_name": tool_name,
+                            "risk_level": r,
+                            "description": opt_str(payload, &["description"]).unwrap_or_else(|| format!("Gated tool {tool_name}")),
+                        }))
+                        .await;
+                }
             }
             let mut body = payload.as_object().cloned().unwrap_or_default();
             body.insert("tool_name".into(), Value::String(tool_name.clone()));
-            body.insert("name".into(), Value::String(tool_name));
-            client.call_mcp_tool(&Value::Object(body)).await.map_err(Into::into)
+            body.insert("name".into(), Value::String(tool_name.clone()));
+            let mut server_res = client.call_mcp_tool(&Value::Object(body)).await?;
+            if server_res.get("status").and_then(|v| v.as_str()) == Some("pending_approval") {
+                let req_id = server_res
+                    .get("request_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let gate = json!({
+                    "approvalId": req_id,
+                    "requestId": req_id,
+                    "toolName": tool_name,
+                    "riskLevel": server_res.get("risk_level").cloned().unwrap_or_else(|| json!("high")),
+                    "status": "pending",
+                });
+                if !req_id.is_empty() {
+                    engine.with_state_mut(|st| {
+                        st.mcp_approvals.insert(req_id, gate.clone());
+                    })?;
+                }
+                server_res["requiresApproval"] = Value::Bool(true);
+                server_res["approval"] = gate;
+            }
+            Ok(server_res)
         }
         "listApprovals" => {
             let hermes_approvals = client.hermes_list_approvals().await.unwrap_or_default();
-            let local_gates: Vec<Value> = engine
+            let tracked_gates: Vec<Value> = engine
                 .persisted_snapshot()
                 .mcp_approvals
                 .into_values()
                 .collect();
             Ok(json!({
                 "hermesApprovals": hermes_approvals,
-                "mcpGates": local_gates,
-                "count": hermes_approvals.len() + local_gates.len()
+                "mcpGates": tracked_gates,
+                "count": hermes_approvals.len() + tracked_gates.len()
             }))
         }
         "decideApproval" => {
-            let approval_id = req_str(payload, &["approvalId", "approval_id", "requestId"], "approvalId")?;
-            let approved = opt_bool(payload, &["approved"]).unwrap_or(true);
-            if approval_id.starts_with("mcp_gate_") {
-                let updated = engine.with_state_mut(|st| {
-                    if let Some(entry) = st.mcp_approvals.get_mut(&approval_id) {
-                        entry["status"] = Value::String(if approved { "approved" } else { "denied" }.into());
-                        return Some(entry.clone());
-                    }
-                    None
-                })?;
-                if let Some(gate) = updated {
-                    return Ok(gate);
-                }
-            }
-            if let Ok(mcp_res) = client
+            let approval_id = req_str(payload, &["approvalId", "approval_id", "requestId", "request_id"], "approvalId")?;
+            let approved = opt_bool(payload, &["approved", "allow"]).unwrap_or(true);
+            if let Ok(mut mcp_res) = client
                 .approve_mcp_permission(&json!({
                     "request_id": approval_id,
                     "approval_id": approval_id,
+                    "allow": approved,
                     "approved": approved
                 }))
                 .await
             {
+                let status_str = if approved { "approved" } else { "denied" };
+                engine.with_state_mut(|st| {
+                    if let Some(entry) = st.mcp_approvals.get_mut(&approval_id) {
+                        entry["status"] = Value::String(status_str.into());
+                    }
+                })?;
+                mcp_res["status"] = Value::String(status_str.into());
+                mcp_res["approvalId"] = Value::String(approval_id);
                 return Ok(mcp_res);
             }
             let req: HermesApprovalDecisionRequest = serde_json::from_value(json!({
@@ -592,10 +638,18 @@ pub async fn handle_magpie(
         }
         "previewMasking" => {
             let text = req_str(payload, &["text", "input"], "text")?;
-            let mut map = payload.as_object().cloned().unwrap_or_default();
-            map.insert("text".into(), Value::String(text));
-            let req: MagpieMaskingPreviewRequest = serde_json::from_value(Value::Object(map))?;
-            to_json_val(client.hermes().magpie_preview_masking(&token, &req).await?)
+            let config = payload
+                .get("config")
+                .and_then(|v| serde_json::from_value::<MagpieMaskingConfigDto>(v.clone()).ok());
+            let req = MagpieMaskingPreviewRequest { text, config };
+            let mut val = to_json_val(client.hermes().magpie_preview_masking(&token, &req).await?)?;
+            if let Some(mt) = val.get("masked_text").cloned() {
+                val["maskedText"] = mt;
+            }
+            if let Some(hc) = val.get("hit_count").cloned() {
+                val["hitCount"] = hc;
+            }
+            Ok(val)
         }
         "updateMasking" => {
             let cfg: MagpieMaskingConfigDto = serde_json::from_value(payload.clone())?;
@@ -641,21 +695,18 @@ pub async fn handle_computers(
             if payload.as_object().map(|m| m.is_empty()).unwrap_or(true) {
                 return to_json_val(client.register_current_host_computer_async().await?);
             }
-            let mut map = payload.as_object().cloned().unwrap_or_default();
-            let dev_id = opt_str(payload, &["deviceId", "device_id", "nodeId"])
-                .unwrap_or_else(|| client.device_id());
-            let label = opt_str(payload, &["label", "name"]).unwrap_or_else(|| "HarmonyOS Workstation".into());
-            map.entry("device_id".to_string())
-                .or_insert_with(|| Value::String(dev_id.clone()));
-            map.entry("node_id".to_string())
-                .or_insert_with(|| Value::String(dev_id));
-            map.entry("label".to_string())
-                .or_insert_with(|| Value::String(label.clone()));
-            map.entry("name".to_string())
-                .or_insert_with(|| Value::String(label));
-            map.entry("os".to_string())
-                .or_insert_with(|| Value::String("OpenHarmony 6.0".into()));
-            let req: RegisterLocalComputerRequest = serde_json::from_value(Value::Object(map))?;
+            let req = RegisterLocalComputerRequest {
+                device_id: opt_str(payload, &["deviceId", "device_id", "nodeId", "node_id"])
+                    .unwrap_or_else(|| client.device_id()),
+                display_name: opt_str(payload, &["displayName", "display_name", "label", "name"])
+                    .unwrap_or_else(|| "HarmonyOS Workstation".into()),
+                ip_address: opt_str(payload, &["ipAddress", "ip_address", "host"])
+                    .unwrap_or_else(|| "100.64.0.2".into()),
+                os_name: opt_str(payload, &["osName", "os_name", "os"])
+                    .unwrap_or_else(|| "OpenHarmony 6.0".into()),
+                resolution: opt_str(payload, &["resolution"])
+                    .unwrap_or_else(|| "2880x1920".into()),
+            };
             to_json_val(client.register_local_computer_async(&req).await?)
         }
         "setRunPolicy" => {
@@ -695,7 +746,7 @@ pub async fn handle_computers(
             let mut lease_req = ComputerControlLeaseRequest::new(
                 controller_id.clone(),
                 run_id.clone(),
-                device_id,
+                device_id.clone(),
                 origin,
                 "exclusive",
             );
@@ -707,13 +758,24 @@ pub async fn handle_computers(
             let server_lease = client
                 .acquire_computer_lease(&json!({
                     "controller_id": controller_id,
+                    "device_id": device_id,
                     "run_id": run_id,
                     "origin": origin,
                     "ttl_ms": lease_req.ttl_ms
                 }))
                 .await
                 .ok();
+            let server_lease_id = server_lease
+                .as_ref()
+                .and_then(|v| v.get("lease").and_then(|l| l.get("lease_id")).and_then(|s| s.as_str()))
+                .map(ToString::to_string);
+            if let Some(ref slid) = server_lease_id {
+                let _ = engine.with_state_mut(|st| {
+                    st.preferences["activeServerLeaseId"] = Value::String(slid.clone());
+                });
+            }
             Ok(json!({
+                "leaseId": server_lease_id,
                 "localLease": lease_snapshot_to_json(&local_lease),
                 "serverLease": server_lease
             }))
@@ -727,7 +789,7 @@ pub async fn handle_computers(
             let mut lease_req = ComputerControlLeaseRequest::new(
                 controller_id.clone(),
                 "emergency_takeover",
-                device_id,
+                device_id.clone(),
                 ComputerControlOrigin::LocalUi,
                 "exclusive",
             );
@@ -752,6 +814,14 @@ pub async fn handle_computers(
             } else {
                 None
             };
+            engine.emit_push(
+                "LeaseRevoked",
+                json!({
+                    "controllerId": controller_id,
+                    "deviceId": device_id,
+                    "takeoverLatencyMs": takeover_ms
+                }),
+            );
 
             Ok(json!({
                 "preempted": true,
@@ -763,11 +833,38 @@ pub async fn handle_computers(
             }))
         }
         "releaseLease" => {
-            let controller_id = req_str(payload, &["controllerId", "controller_id"], "controllerId")?;
+            let controller_id = opt_str(payload, &["controllerId", "controller_id"])
+                .unwrap_or_else(|| client.device_id());
             let run_id = opt_str(payload, &["runId", "run_id"])
                 .unwrap_or_else(|| "default_run".to_string());
             let released = release_control_lease(&controller_id, &run_id);
-            Ok(json!({ "released": released, "controllerId": controller_id, "runId": run_id }))
+            let lease_id = opt_str(payload, &["leaseId", "lease_id"]).or_else(|| {
+                engine
+                    .persisted_snapshot()
+                    .preferences
+                    .get("activeServerLeaseId")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+            });
+            let mut server_released = None;
+            if let Some(ref t) = client.token() {
+                server_released = client
+                    .http_client
+                    .request_json::<_, Value>(
+                        reqwest::Method::POST,
+                        "/api/v1/computer/lease/release",
+                        Some(t),
+                        Some(&json!({ "lease_id": lease_id })),
+                    )
+                    .await
+                    .ok();
+            }
+            Ok(json!({
+                "released": released,
+                "controllerId": controller_id,
+                "runId": run_id,
+                "serverRelease": server_released
+            }))
         }
         other => Err(CoreDispatchError::new(
             "UNKNOWN_ACTION",

@@ -66,99 +66,331 @@ fn snake_to_camel(s: &str) -> String {
     out
 }
 
+pub fn normalize_domain_and_action(domain: &str, action: &str) -> (String, String) {
+    let d = match domain.trim() {
+        "session" => "sessions",
+        "dialog" | "chats" | "chat" => "dialogs",
+        "folder" => "folders",
+        "topic" => "topics",
+        "message" => "messages",
+        "contact" => "contacts",
+        "setting" => "settings",
+        "call" | "webrtc" => "calls",
+        "bot" | "botfather" => "bots",
+        "miniapp" | "mini_apps" => "miniapps",
+        "task" | "kanban" | "cron" => "tasks",
+        "computer" => "computers",
+        "update" | "updates" => "updater",
+        other => other,
+    };
+
+    let camel = snake_to_camel(action.trim());
+    let a = match (d, camel.as_str()) {
+        // 1. auth
+        ("auth", "status" | "serverStatus" | "getServerStatus" | "health" | "checkHealth") => "checkHealth",
+        ("auth", "setServerUrl") => "setServerConfig",
+        ("auth", "setProxy") => "setProxyConfig",
+        ("auth", "register" | "registerPassword") => "registerPassword",
+        ("auth", "login" | "loginPassword") => "loginPassword",
+        ("auth", "phoneSendCode") => "sendPhoneCode",
+        ("auth", "phoneVerify" | "verifyPhoneOtp") => "verifyPhoneCode",
+        ("auth", "twoFactorStatus") => "get2faStatus",
+        ("auth", "twoFactorSet" | "set2fa" | "enable2fa") => "setup2fa",
+        ("auth", "twoFactorDisable") => "disable2fa",
+        ("auth", "twoFactorVerify") => "verify2fa",
+        ("auth", "emailSendCode" | "sendEmailOtp") => "sendEmailCode",
+        ("auth", "emailRegister" | "verifyEmailOtp") => "registerEmail",
+        ("auth", "alipayStart" | "startAlipayAuth") => "startAlipayQr",
+        ("auth", "alipayPoll" | "pollAlipayAuth") => "pollAlipayQr",
+        ("auth", "alipaySimulateScan") => "simulateAlipayScan",
+        ("auth", "qrPairInit" | "initQrPair" | "startQrLogin") => "startQrPairing",
+        ("auth", "qrPairAccept" | "acceptQrPair" | "confirmQrLogin") => "approveQrPairing",
+        ("auth", "qrPairPoll" | "pollQrPair" | "pollQrLogin") => "pollQrPairing",
+        ("auth", "startPasskeyChallenge") => "passkeyChallenge",
+        ("auth", "passkeyRegister") => "registerPasskey",
+        ("auth", "passkeyVerify" | "finishPasskeyAssertion") => "verifyPasskey",
+        ("auth", "passkeyList") => "listPasskeys",
+        ("auth", "me") => "getMe",
+
+        // 2. sessions
+        ("sessions", "list" | "current" | "getCurrentSession") => "listAccounts",
+        ("sessions", "add") => "addAccount",
+        ("sessions", "switch") => "switchAccount",
+        ("sessions", "remove") => "removeAccount",
+        ("sessions", "listSessions" | "devices") => "listDeviceSessions",
+        ("sessions", "revokeSession") => "revokeDeviceSession",
+        ("sessions", "setPasscode") => "setPasscodeLock",
+        ("sessions", "lock") => "lockApp",
+        ("sessions", "unlock" | "verifyPasscode") => "unlockApp",
+        ("sessions", "getPasscodeStatus") => "passcodeStatus",
+        ("sessions", "assetStatus") => "verifyAssetToken",
+        ("sessions", "fence" | "generation") => "checkGenerationFence",
+
+        // 3. dialogs
+        ("dialogs", "list" | "listDialogs" | "listCached" | "listCachedDialogs") => "listChats",
+        ("dialogs", "create" | "createGroup") => "createChat",
+        ("dialogs", "get" | "getDialog") => "getChat",
+        ("dialogs", "update" | "updateDialog") => "updateChat",
+        ("dialogs", "delete" | "deleteDialog") => "deleteChat",
+        ("dialogs", "leave" | "leaveDialog") => "leaveChat",
+        ("dialogs", "archive" | "archiveChat" | "setArchived") => "setArchive",
+        ("dialogs", "pin" | "pinChat" | "pinDialog" | "setPinned") => "setPin",
+        ("dialogs", "mute" | "muteChat" | "setMuted") => "setMute",
+        ("dialogs", "ttl") => "setTtl",
+        ("dialogs", "setDraft") => "saveDraft",
+        ("dialogs", "deleteDraft") => "clearDraft",
+        ("dialogs", "welcome") => "provisionWelcomeChat",
+
+        // 4. folders
+        ("folders", "list") => "listFolders",
+        ("folders", "create" | "saveFolder") => "createFolder",
+        ("folders", "update") => "updateFolder",
+        ("folders", "delete") => "deleteFolder",
+
+        // 5. topics
+        ("topics", "list") => "listTopics",
+        ("topics", "create") => "createTopic",
+        ("topics", "update") => "updateTopic",
+        ("topics", "delete") => "deleteTopic",
+
+        // 6. search
+        ("search", "global" | "all" | "categorized") => "searchAll",
+        ("search", "chats") => "searchChats",
+        ("search", "messages" | "inChat" | "searchInChat") => "searchMessages",
+        ("search", "hybrid") => "searchHybrid",
+        ("search", "catalog" | "globalCatalog" | "searchCatalog") => "searchGlobalCatalog",
+
+        // 7. messages
+        ("messages", "send" | "sendText") => "sendMessage",
+        ("messages", "history" | "getHistory" | "list" | "cached" | "getCachedMessages") => "listHistory",
+        ("messages", "edit") => "editMessage",
+        ("messages", "delete" | "deleteMessage") => "deleteMessages",
+        ("messages", "forward" | "forwardMessage") => "forwardMessages",
+        ("messages", "pin") => "pinMessage",
+        ("messages", "unpin") => "unpinMessage",
+        ("messages", "listPins" | "pins") => "listPinnedMessages",
+        ("messages", "react") => "toggleReaction",
+        ("messages", "read") => "markRead",
+        ("messages", "translate") => "translateMessage",
+        ("messages", "report") => "reportMessage",
+        ("messages", "stories") => "listStories",
+        ("messages", "postStory") => "createStory",
+        ("messages", "instantView") => "openInstantView",
+        ("messages", "sendAs") => "listSendAsPeers",
+
+        // 8. outbox
+        ("outbox", "enqueue" | "enqueueMessage") => "enqueueOffline",
+        ("outbox", "list" | "pending" | "listOutbox" | "pendingCount") => "listPending",
+        ("outbox", "flush" | "flushNow" | "reconnectAndFlush") => "flushOutbox",
+        ("outbox", "setOnline" | "setOfflineMode") => "simulateNetworkChange",
+
+        // 9. sync
+        ("sync", "state" | "getPtsState") => "getState",
+        ("sync", "difference") => "getDifference",
+        ("sync", "applyPts") => "applyPtsUpdate",
+
+        // 10. media
+        ("media", "upload" | "uploadBytes") => "uploadFile",
+        ("media", "initChunked") => "initChunkedUpload",
+        ("media", "uploadStatus") => "getUploadStatus",
+        ("media", "completeChunked") => "completeChunkedUpload",
+        ("media", "download" | "downloadFile") => "downloadRange",
+        ("media", "metadata") => "getMetadata",
+        ("media", "encodeWaveform") => "encodeWaveform5Bit",
+        ("media", "decodeWaveform") => "decodeWaveform5Bit",
+        ("media", "recordVoice") => "recordVoicePcm",
+        ("media", "edit" | "editImage") => "editMedia",
+        ("media", "stickers" | "listStickerSets") => "listStickers",
+        ("media", "gifs") => "searchGifs",
+        ("media", "startVoice") => "startVoiceRecorder",
+        ("media", "stopVoice") => "stopVoiceRecorder",
+
+        // 11. e2ee
+        ("e2ee", "init" | "identity" | "generateIdentity") => "initIdentity",
+        ("e2ee", "publishPrekeys" | "publishPreKeyBundle") => "uploadPrekeys",
+        ("e2ee", "fetchPrekeys" | "fetchPreKeyBundle") => "fetchPrekeyBundle",
+        ("e2ee", "establish") => "establishX3dh",
+        ("e2ee", "sendDm") => "sendEncryptedDm",
+        ("e2ee", "encryptDm") => "encryptDirect",
+        ("e2ee", "decryptDm" | "decryptEnvelope" | "decryptMessage") => "decryptDirect",
+        ("e2ee", "initSenderKey") => "initGroupSenderKey",
+        ("e2ee", "sendGroup") => "sendEncryptedGroup",
+        ("e2ee", "safetyFingerprint" | "computeSafetyNumbers") => "computeSafetyNumber",
+
+        // 12. contacts
+        ("contacts", "list") => "listContacts",
+        ("contacts", "add") => "addContact",
+        ("contacts", "delete" | "remove") => "deleteContact",
+        ("contacts", "resolve" | "resolvePeer") => "resolveUsername",
+        ("contacts", "block") => "blockUser",
+        ("contacts", "unblock") => "unblockUser",
+        ("contacts", "blocked") => "listBlocked",
+
+        // 13. inspector
+        ("inspector", "profile" | "getProfile") => "getPeerProfile",
+        ("inspector", "members") => "listMembers",
+        ("inspector", "addMember") => "addMembers",
+        ("inspector", "updateRole") => "updateMemberRole",
+        ("inspector", "invites") => "listInvites",
+        ("inspector", "joinInvite") => "joinByInvite",
+        ("inspector", "sharedMedia") => "listSharedMedia",
+        ("inspector", "stats" | "statistics") => "getChannelStatistics",
+
+        // 14. settings
+        ("settings", "sections") => "listSections",
+        ("settings", "get") => "getPreferences",
+        ("settings", "update") => "updatePreferences",
+        ("settings", "theme") => "setTheme",
+        ("settings", "locale") => "setLocale",
+        ("settings", "storage") => "getStorageStats",
+        ("settings", "clearCache") => "clearStorageCache",
+        ("settings", "exportChat") => "exportChatHistory",
+        ("settings", "setBadge") => "setNotificationBadge",
+        ("settings", "updateBusiness") => "updateBusinessSection",
+
+        // 15. wallet
+        ("wallet", "balance" | "starsBalance" | "getBalance") => "getStarsBalance",
+        ("wallet", "transactions") => "listTransactions",
+        ("wallet", "topup" | "topUp" | "topupStars") => "topUpStars",
+        ("wallet", "gift" | "sendGift") => "sendStarGift",
+        ("wallet", "redeem") => "redeemCode",
+        ("wallet", "tonState" | "tonWallet") => "getTonWalletState",
+        ("wallet", "createTon") => "createTonWallet",
+
+        // 16. passport
+        ("passport", "get" | "state" | "getState" | "vault" | "getPassportVault" | "listDocuments") => "getPassportState",
+        ("passport", "saveDocument" | "upsertDocument") => "savePassportDocument",
+        ("passport", "deleteDocument") => "deletePassportDocument",
+        ("passport", "authorize") => "authorizePassportRequest",
+
+        // 17. calls
+        ("calls", "invite" | "start") => "startCall",
+        ("calls", "accept") => "acceptCall",
+        ("calls", "decline" | "reject") => "rejectCall",
+        ("calls", "hangup" | "end") => "endCall",
+        ("calls", "joinSfu") => "joinSfuRoom",
+        ("calls", "signal") => "sendSignal",
+        ("calls", "turnCredentials") => "getTurnCredentials",
+        ("calls", "rate") => "rateCall",
+        ("calls", "list" | "history" | "listCalls") => "listCallHistory",
+        ("calls", "setVoipTask") => "setBackgroundVoipTask",
+
+        // 18. talk
+        ("talk", "start" | "startSession") => "startTalkSession",
+        ("talk", "vad" | "processVad") => "processVadFrame",
+        ("talk", "turn" | "submitTurn") => "submitTalkTurn",
+        ("talk", "bargeIn" | "abort") => "bargeInAbort",
+        ("talk", "stop" | "stopSession") => "stopTalkSession",
+
+        // 19. bots
+        ("bots", "create") => "createBot",
+        ("bots", "nlCreate" | "createFromPrompt") => "createBotFromPrompt",
+        ("bots", "list" | "myBots") => "listBots",
+        ("bots", "profile") => "getBotProfile",
+        ("bots", "update") => "updateBotProfile",
+        ("bots", "setCommands") => "setBotCommands",
+        ("bots", "addToChat") => "addBotToChat",
+        ("bots", "callback") => "sendCallbackQuery",
+        ("bots", "inline") => "inlineQuery",
+
+        // 20. miniapps
+        ("miniapps", "list" | "catalog" | "listApps") => "listCatalog",
+        ("miniapps", "register" | "create") => "registerMiniApp",
+        ("miniapps", "launch") => "launchMiniApp",
+        ("miniapps", "validateInitData") => "verifyInitDataHmac",
+        ("miniapps", "storageSet") => "cloudStorageSet",
+        ("miniapps", "storageGet") => "cloudStorageGet",
+        ("miniapps", "storageDelete") => "cloudStorageDelete",
+        ("miniapps", "renderA2ui") => "renderUiSchema",
+
+        // 21. fabushi
+        ("fabushi", "init") => "bootstrap",
+        ("fabushi", "profile") => "getProfile",
+        ("fabushi", "globe") => "getGlobe",
+        ("fabushi", "offer" | "offering") => "createOffering",
+        ("fabushi", "meditate") => "recordMeditation",
+        ("fabushi", "records") => "listPracticeRecords",
+        ("fabushi", "sutras") => "listSutras",
+        ("fabushi", "leaderboard") => "getLeaderboard",
+        ("fabushi", "vip") => "subscribeVip",
+        ("fabushi", "aiGuide" | "aiChat") => "aiGuideChat",
+
+        // 22. hermes
+        ("hermes", "status") => "getStatus",
+        ("hermes", "turn" | "runTurn") => "startTurn",
+        ("hermes", "streamEvents") => "streamTurnEvents",
+        ("hermes", "command" | "slash") => "runSlashCommand",
+        ("hermes", "commands") => "listCommands",
+        ("hermes", "sessions") => "listSessions",
+        ("hermes", "branch") => "branchSession",
+        ("hermes", "undo" | "rollback") => "undoSession",
+        ("hermes", "export") => "exportSession",
+        ("hermes", "memory") => "getMemory",
+        ("hermes", "saveMemory") => "updateMemory",
+        ("hermes", "soul") => "getSoul",
+        ("hermes", "saveSoul") => "updateSoul",
+        ("hermes", "honcho") => "getHoncho",
+        ("hermes", "skills") => "listSkills",
+        ("hermes", "saveSkill") => "proposeSkill",
+        ("hermes", "toolsets") => "listToolsets",
+        ("hermes", "updateToolsets") => "setToolsetPreset",
+
+        // 23. tasks
+        ("tasks", "create") => "createTask",
+        ("tasks", "transition") => "transitionTask",
+        ("tasks", "list") => "listTasks",
+        ("tasks", "kanbanBoards") => "listKanban",
+        ("tasks", "createBoard") => "createKanbanBoard",
+        ("tasks", "createCard") => "createKanbanCard",
+        ("tasks", "moveCard") => "moveKanbanCard",
+        ("tasks", "crons") => "listCrons",
+        ("tasks", "saveCron") => "createCron",
+        ("tasks", "runCron") => "runCronNow",
+        ("tasks", "acp") => "acpRpc",
+
+        // 24. mcp
+        ("mcp", "servers") => "listServers",
+        ("mcp", "tools") => "listTools",
+        ("mcp", "call" | "callTool") => "invokeTool",
+        ("mcp", "approvals") => "listApprovals",
+        ("mcp", "approve") => "decideApproval",
+        ("mcp", "actions") => "listActions",
+        ("mcp", "invokeAction") => "invokeActionBus",
+
+        // 25. magpie
+        ("magpie", "state") => "getState",
+        ("magpie", "providers") => "listProviders",
+        ("magpie", "saveProvider") => "upsertProvider",
+        ("magpie", "probe") => "probeProvider",
+        ("magpie", "upsertGroup") => "upsertRoutingGroup",
+        ("magpie", "import") => "importConfig",
+        ("magpie", "chatCompletion") => "proxyChatCompletion",
+
+        // 26. computers
+        ("computers", "list") => "listComputers",
+        ("computers", "registerLocal" | "register") => "registerComputer",
+        ("computers", "setPolicy") => "setRunPolicy",
+        ("computers", "exec") => "execSandboxOp",
+        ("computers", "takeover") => "emergencyTakeover",
+
+        // 27. tailnet
+        ("tailnet", "register" | "registerNode") => "registerDevice",
+        ("tailnet", "netmap" | "getNetmap") => "getNetMap",
+        ("tailnet", "stun") => "stunProbe",
+        ("tailnet", "derp") => "derpRelayTest",
+
+        // 28. updater
+        ("updater", "check") => "checkForUpdates",
+        ("updater", "verify" | "verifyManifest") => "verifyReleaseManifest",
+
+        (_, other) => other,
+    };
+
+    (d.to_string(), a.to_string())
+}
+
 pub fn normalize_action(domain: &str, action: &str) -> String {
-    match (domain, action) {
-        ("auth", "status") | ("auth", "server_status") | ("auth", "getServerStatus") => "checkHealth".into(),
-        ("auth", "phone_send_code") | ("auth", "phoneSendCode") => "sendPhoneCode".into(),
-        ("auth", "phone_verify") | ("auth", "phoneVerify") => "verifyPhoneOtp".into(),
-        ("auth", "two_factor_status") | ("auth", "twoFactorStatus") => "get2faStatus".into(),
-        ("auth", "two_factor_set") | ("auth", "twoFactorSet") => "enable2fa".into(),
-        ("auth", "two_factor_disable") | ("auth", "twoFactorDisable") => "disable2fa".into(),
-        ("auth", "two_factor_verify") | ("auth", "twoFactorVerify") => "verify2fa".into(),
-        ("auth", "email_send_code") | ("auth", "emailSendCode") => "sendEmailOtp".into(),
-        ("auth", "email_register") | ("auth", "emailRegister") => "verifyEmailOtp".into(),
-        ("auth", "alipay_start") | ("auth", "alipayStart") => "startAlipayAuth".into(),
-        ("auth", "alipay_poll") | ("auth", "alipayPoll") => "pollAlipayAuth".into(),
-        ("auth", "qr_pair_init") | ("auth", "qrPairInit") => "startQrLogin".into(),
-        ("auth", "qr_pair_accept") | ("auth", "qrPairAccept") => "confirmQrLogin".into(),
-        ("auth", "qr_pair_poll") | ("auth", "qrPairPoll") => "pollQrLogin".into(),
-        ("auth", "passkey_challenge") | ("auth", "passkeyChallenge") => "startPasskeyChallenge".into(),
-        ("auth", "passkey_register") | ("auth", "passkeyRegister") => "registerPasskey".into(),
-        ("auth", "passkey_verify") | ("auth", "passkeyVerify") => "finishPasskeyAssertion".into(),
-
-        ("sessions", "current") => "getCurrentSession".into(),
-        ("sessions", "set_passcode") | ("sessions", "setPasscode") => "setPasscodeLock".into(),
-        ("sessions", "verify_passcode") | ("sessions", "verifyPasscode") => "unlockApp".into(),
-        ("sessions", "passcode_status") | ("sessions", "passcodeStatus") => "getPasscodeStatus".into(),
-
-        ("dialogs", "list") => "listDialogs".into(),
-        ("dialogs", "list_cached") | ("dialogs", "listCached") => "listCachedDialogs".into(),
-        ("dialogs", "get") => "getDialog".into(),
-        ("dialogs", "create") => "createGroup".into(),
-        ("dialogs", "update") => "updateDialog".into(),
-        ("dialogs", "delete") => "deleteDialog".into(),
-        ("dialogs", "leave") => "leaveDialog".into(),
-        ("dialogs", "archive") => "setArchived".into(),
-        ("dialogs", "pin_dialog") | ("dialogs", "pinDialog") => "setPinned".into(),
-        ("dialogs", "mute") => "setMuted".into(),
-
-        ("folders", "list") => "listFolders".into(),
-        ("folders", "create") => "createFolder".into(),
-        ("folders", "update") => "updateFolder".into(),
-        ("folders", "delete") => "deleteFolder".into(),
-
-        ("topics", "list") => "listTopics".into(),
-        ("topics", "create") => "createTopic".into(),
-        ("topics", "update") => "updateTopic".into(),
-        ("topics", "delete") => "deleteTopic".into(),
-
-        ("search", "messages") => "searchMessages".into(),
-        ("search", "global_catalog") | ("search", "globalCatalog") => "searchCatalog".into(),
-        ("search", "categorized") => "searchAll".into(),
-
-        ("messages", "history") => "getHistory".into(),
-        ("messages", "cached") => "getCachedMessages".into(),
-        ("messages", "edit") => "editMessage".into(),
-        ("messages", "delete") => "deleteMessage".into(),
-        ("messages", "forward") => "forwardMessages".into(),
-        ("messages", "translate") => "translateMessage".into(),
-        ("messages", "report") => "reportMessage".into(),
-
-        ("outbox", "list") => "listOutbox".into(),
-        ("outbox", "pending_count") | ("outbox", "pendingCount") => "pendingCount".into(),
-        ("outbox", "flush") | ("outbox", "reconnect_and_flush") => "flushOutbox".into(),
-        ("outbox", "set_online") | ("outbox", "setOnline") => "setOfflineMode".into(),
-
-        ("sync", "get_state") | ("sync", "getState") => "getPtsState".into(),
-
-        ("media", "upload_bytes") | ("media", "uploadBytes") => "uploadFile".into(),
-        ("media", "download") => "downloadFile".into(),
-        ("media", "metadata") => "getMetadata".into(),
-        ("media", "list_sticker_sets") | ("media", "listStickerSets") => "listStickers".into(),
-
-        ("e2ee", "identity") | ("e2ee", "generateIdentity") => "initIdentity".into(),
-        ("e2ee", "publish_prekeys") | ("e2ee", "publishPreKeyBundle") | ("e2ee", "publishPrekeys") => "uploadPrekeys".into(),
-        ("e2ee", "fetch_prekey_bundle") | ("e2ee", "fetchPreKeyBundle") => "fetchPrekeyBundle".into(),
-        ("e2ee", "safety_fingerprint") | ("e2ee", "safetyFingerprint") | ("e2ee", "computeSafetyNumbers") => "computeSafetyNumber".into(),
-        ("e2ee", "decrypt_message") | ("e2ee", "decryptMessage") | ("e2ee", "decryptDm") => "decryptDirect".into(),
-        ("e2ee", "encryptDm") => "encryptDirect".into(),
-
-        ("contacts", "list") => "listContacts".into(),
-        ("contacts", "add") => "addContact".into(),
-        ("contacts", "delete") => "deleteContact".into(),
-        ("contacts", "block") => "blockUser".into(),
-        ("contacts", "unblock") => "unblockUser".into(),
-        ("contacts", "list_blocked") | ("contacts", "listBlocked") => "listBlocked".into(),
-
-        ("wallet", "balance") => "getBalance".into(),
-        ("wallet", "transactions") => "listTransactions".into(),
-        ("wallet", "topup_stars") | ("wallet", "topupStars") => "topupStars".into(),
-
-        ("tailnet", "register") | ("tailnet", "registerNode") | ("tailnet", "register_node") => "registerDevice".into(),
-        ("tailnet", "netmap") | ("tailnet", "get_netmap") => "getNetMap".into(),
-
-        _ => snake_to_camel(action),
-    }
+    normalize_domain_and_action(domain, action).1
 }
 
 pub async fn dispatch_async(
@@ -167,9 +399,9 @@ pub async fn dispatch_async(
     action: &str,
     payload: &Value,
 ) -> CoreResult<Value> {
-    let norm = normalize_action(domain, action);
-    let act = norm.as_str();
-    match domain {
+    let (norm_domain, norm_action) = normalize_domain_and_action(domain, action);
+    let act = norm_action.as_str();
+    match norm_domain.as_str() {
         "auth" => auth_sessions::handle_auth(engine, act, payload).await,
         "sessions" => auth_sessions::handle_sessions(engine, act, payload).await,
         "dialogs" => dialogs_search::handle_dialogs(engine, act, payload).await,

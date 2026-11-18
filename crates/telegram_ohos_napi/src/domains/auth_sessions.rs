@@ -115,6 +115,7 @@ pub async fn handle_auth(
             let healthy = client.check_health().await?;
             let status = client.fetch_server_status().await?;
             Ok(json!({
+                "ok": healthy,
                 "healthy": healthy,
                 "status": status
             }))
@@ -141,6 +142,10 @@ pub async fn handle_auth(
             let auth = client.register(&req).await?;
             let slot = engine.record_authenticated_session(&auth)?;
             Ok(json!({
+                "userId": auth.user_id,
+                "user_id": auth.user_id,
+                "username": auth.username,
+                "token": auth.token,
                 "session": auth,
                 "account": slot
             }))
@@ -180,6 +185,10 @@ pub async fn handle_auth(
             let slot = engine.record_authenticated_session(&auth)?;
             Ok(json!({
                 "twoFactorRequired": false,
+                "userId": auth.user_id,
+                "user_id": auth.user_id,
+                "username": auth.username,
+                "token": auth.token,
                 "session": auth,
                 "account": slot
             }))
@@ -245,8 +254,7 @@ pub async fn handle_auth(
             let hint = opt_str(payload, &["hint", "passwordHint"]);
             let recovery_email = opt_str(payload, &["recoveryEmail", "recovery_email", "email"]);
             let mut map = serde_json::Map::new();
-            map.insert("new_password".into(), Value::String(new_pw.clone()));
-            map.insert("password".into(), Value::String(new_pw));
+            map.insert("new_password".into(), Value::String(new_pw));
             if let Some(c) = cur_pw {
                 map.insert("current_password".into(), Value::String(c));
             }
@@ -269,13 +277,19 @@ pub async fn handle_auth(
             )?;
             let mut map = serde_json::Map::new();
             map.insert("password".into(), Value::String(password));
-            map.insert("pending_token".into(), Value::String(pending.clone()));
-            map.insert("login_token".into(), Value::String(pending));
+            map.insert("pending_token".into(), Value::String(pending));
             let req: TwoFactorVerifyRequest = serde_json::from_value(Value::Object(map))?;
             let client = engine.client()?;
             let auth = client.verify_2fa(&req).await?;
             let slot = engine.record_authenticated_session(&auth)?;
-            Ok(json!({ "session": auth, "account": slot }))
+            Ok(json!({
+                "userId": auth.user_id,
+                "user_id": auth.user_id,
+                "username": auth.username,
+                "token": auth.token,
+                "session": auth,
+                "account": slot
+            }))
         }
         "disable2fa" => {
             let cur = opt_str(payload, &["currentPassword", "current_password", "password"]);
@@ -650,6 +664,15 @@ pub async fn handle_sessions(
                 "locked": false,
                 "unlocked": true,
                 "failedAttempts": 0
+            }))
+        }
+        "passcodeStatus" => {
+            let snap = engine.persisted_snapshot();
+            Ok(json!({
+                "passcodeEnabled": snap.passcode_enabled,
+                "locked": snap.locked,
+                "autoLockSeconds": snap.auto_lock_seconds,
+                "failedUnlockAttempts": snap.failed_unlock_attempts
             }))
         }
         "verifyAssetToken" => {

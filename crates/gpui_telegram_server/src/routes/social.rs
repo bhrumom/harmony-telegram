@@ -311,13 +311,17 @@ pub async fn calls_signal(auth: AuthBearer, State(state): State<Arc<AppState>>, 
             }
             SignalingFrame::Offer { call_id: req.call_id.clone(), sdp: req.sdp.clone().unwrap_or_default() }
         }
+        "renegotiate" => {
+            let sdp = req.sdp.clone().unwrap_or_else(|| "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=renegotiate\r\n".into());
+            SignalingFrame::Offer { call_id: req.call_id.clone(), sdp }
+        }
         "answer" => {
             if req.sdp.as_deref().unwrap_or("").trim().is_empty() {
                 return err_resp(StatusCode::BAD_REQUEST, "invalid_payload", "sdp is required for answer");
             }
             SignalingFrame::Answer { call_id: req.call_id.clone(), sdp: req.sdp.clone().unwrap_or_default() }
         }
-        "ice_candidate" | "ice" => {
+        "ice_candidate" | "ice-candidate" | "candidate" | "ice" => {
             if req.candidate.as_deref().unwrap_or("").trim().is_empty() {
                 return err_resp(StatusCode::BAD_REQUEST, "invalid_payload", "candidate is required for ice_candidate");
             }
@@ -367,6 +371,75 @@ pub async fn calls_signal(auth: AuthBearer, State(state): State<Arc<AppState>>, 
         signal: Some(req.clone()),
     }));
     (StatusCode::OK, Json(json!({ "call_id": req.call_id, "user_id": auth.user_id.0, "status": "relayed", "call": updated }))).into_response()
+}
+
+fn extract_call_id_from_body(body: &Bytes) -> Result<String, Response> {
+    let payload = parse_json_object(body)?;
+    payload
+        .get("call_id")
+        .or_else(|| payload.get("callId"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| err_resp(StatusCode::BAD_REQUEST, "invalid_payload", "call_id is required"))
+}
+
+pub async fn calls_accept(auth: AuthBearer, State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let call_id = match extract_call_id_from_body(&body) { Ok(id) => id, Err(r) => return r };
+    let updated = match state.db.apply_call_signal(&call_id, auth.user_id.0, "accept", Utc::now().timestamp_millis()) {
+        Ok(CallSignalOutcome::Applied(c)) => c,
+        Ok(CallSignalOutcome::NotFound) => return err_resp(StatusCode::NOT_FOUND, "not_found", "Call not found"),
+        Ok(CallSignalOutcome::Forbidden(msg)) => return err_resp(StatusCode::FORBIDDEN, "forbidden", msg),
+        Ok(CallSignalOutcome::Conflict { code, message }) => return err_resp(StatusCode::CONFLICT, code, message),
+        Err(e) => return map_telegram_err(e),
+    };
+    let _ = state.signaling_hub.dispatch_frame(auth.user_id, SignalingFrame::Accept { call_id: call_id.clone() }).await;
+    let peer = if updated.caller_id == auth.user_id.0 { UserId(updated.callee_id) } else { UserId(updated.caller_id) };
+    state.gateway_hub.broadcast_to_user(peer, WsServerFrame::Update(UpdateEvent::CallUpdated {
+        call_id: call_id.clone(),
+        state: updated.state.clone(),
+        signal: None,
+    }));
+    (StatusCode::OK, Json(updated)).into_response()
+}
+
+pub async fn calls_decline(auth: AuthBearer, State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let call_id = match extract_call_id_from_body(&body) { Ok(id) => id, Err(r) => return r };
+    let updated = match state.db.apply_call_signal(&call_id, auth.user_id.0, "decline", Utc::now().timestamp_millis()) {
+        Ok(CallSignalOutcome::Applied(c)) => c,
+        Ok(CallSignalOutcome::NotFound) => return err_resp(StatusCode::NOT_FOUND, "not_found", "Call not found"),
+        Ok(CallSignalOutcome::Forbidden(msg)) => return err_resp(StatusCode::FORBIDDEN, "forbidden", msg),
+        Ok(CallSignalOutcome::Conflict { code, message }) => return err_resp(StatusCode::CONFLICT, code, message),
+        Err(e) => return map_telegram_err(e),
+    };
+    let _ = state.signaling_hub.dispatch_frame(auth.user_id, SignalingFrame::Hangup { call_id: call_id.clone(), reason: "decline".into() }).await;
+    let peer = if updated.caller_id == auth.user_id.0 { UserId(updated.callee_id) } else { UserId(updated.caller_id) };
+    state.gateway_hub.broadcast_to_user(peer, WsServerFrame::Update(UpdateEvent::CallUpdated {
+        call_id: call_id.clone(),
+        state: updated.state.clone(),
+        signal: None,
+    }));
+    (StatusCode::OK, Json(updated)).into_response()
+}
+
+pub async fn calls_hangup(auth: AuthBearer, State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let call_id = match extract_call_id_from_body(&body) { Ok(id) => id, Err(r) => return r };
+    let updated = match state.db.apply_call_signal(&call_id, auth.user_id.0, "hangup", Utc::now().timestamp_millis()) {
+        Ok(CallSignalOutcome::Applied(c)) => c,
+        Ok(CallSignalOutcome::NotFound) => return err_resp(StatusCode::NOT_FOUND, "not_found", "Call not found"),
+        Ok(CallSignalOutcome::Forbidden(msg)) => return err_resp(StatusCode::FORBIDDEN, "forbidden", msg),
+        Ok(CallSignalOutcome::Conflict { code, message }) => return err_resp(StatusCode::CONFLICT, code, message),
+        Err(e) => return map_telegram_err(e),
+    };
+    let _ = state.signaling_hub.dispatch_frame(auth.user_id, SignalingFrame::Hangup { call_id: call_id.clone(), reason: "hangup".into() }).await;
+    let peer = if updated.caller_id == auth.user_id.0 { UserId(updated.callee_id) } else { UserId(updated.caller_id) };
+    state.gateway_hub.broadcast_to_user(peer, WsServerFrame::Update(UpdateEvent::CallUpdated {
+        call_id: call_id.clone(),
+        state: updated.state.clone(),
+        signal: None,
+    }));
+    (StatusCode::OK, Json(updated)).into_response()
 }
 
 pub async fn calls_rate(auth: AuthBearer, State(state): State<Arc<AppState>>, Path(call_id): Path<String>, body: Bytes) -> Response {
